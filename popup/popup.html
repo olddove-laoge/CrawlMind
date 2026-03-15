@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 400px; padding: 16px; font-family: system-ui; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    h1 { font-size: 18px; margin: 0; }
+    #analyzeBtn { padding: 8px 16px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    #fieldsList { 
+  background: #282c34; 
+  color: #abb2bf; 
+  padding: 12px; 
+  border-radius: 4px; 
+  overflow-x: auto; 
+  white-space: pre-wrap;
+  font-family: monospace;
+  font-size: 11px;
+}
+    .hidden { display: none; }
+    #chatMessages { height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 8px; margin-bottom: 8px; }
+    .user-msg { color: #2196F3; margin: 4px 0; }
+    .ai-msg { color: #666; margin: 4px 0; }
+    .thinking { color: #ff9800; font-size: 12px; margin-left: 16px; border-left: 2px solid #ff9800; padding-left: 8px; }
+    .thinking-header { cursor: pointer; color: #ff9800; font-size: 12px; display: flex; align-items: center; gap: 4px; }
+    .thinking-header:hover { color: #f57c00; }
+    .thinking-content { display: none; padding: 8px; background: #fff3e0; border-radius: 4px; margin-top: 4px; font-size: 11px; }
+    .thinking-content.expanded { display: block; }
+    .thinking-toggle { font-size: 10px; }
+    .thinking-section { margin: 8px 0; padding: 8px; background: #f8f9fa; border-radius: 4px; border-left: 3px solid #ff9800; }
+    .thinking-step { font-size: 11px; color: #666; padding: 2px 0; }
+    .input-area { display: flex; gap: 8px; }
+    #userInput { flex: 1; padding: 8px; }
+    #sendBtn { padding: 8px 16px; background: #2196F3; color: white; border: none; border-radius: 4px; }
+    #codeOutput { margin-top: 16px; }
+    pre { background: #282c34; color: #abb2bf; padding: 12px; overflow-x: auto; border-radius: 4px; }
+    .field-item { padding: 4px 0; border-bottom: 1px solid #eee; }
+    .field-name { font-weight: bold; color: #2196F3; }
+    .field-value { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>CrawlMind</h1>
+    <button id="analyzeBtn">分析页面</button>
+  </div>
+  
+  <!-- API设置 -->
+  <div class="settings">
+    <input type="password" id="apiKeyInput" placeholder="输入 DeepSeek API Key" style="width: 70%; padding: 8px;">
+    <button id="saveApiKey" style="padding: 8px 12px;">保存</button>
+  </div>
+  
+  <div id="analysisResult" class="hidden">
+    <h3>页面分析结果</h3>
+    <div id="fieldsList"></div>
+  </div>
+  <div class="chat-section">
+    <h3>与AI对话</h3>
+    <div id="chatMessages"></div>
+    <div class="input-area">
+      <input type="text" id="userInput" placeholder="描述你想爬取的数据...">
+      <button id="sendBtn">发送</button>
+    </div>
+  </div>
+  <div id="codeOutput" class="hidden">
+    <h3>生成的爬虫代码</h3>
+    <pre id="spiderCode"></pre>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
