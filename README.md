@@ -1,10 +1,10 @@
 # CrawlMind 🤖
 
-AI-powered Chrome 插件 - 智能网页数据提取工具
+AI-powered Chrome/Edge 插件 - 智能网页数据提取工具
 
 ## 简介
 
-CrawlMind 是一款基于 DeepSeek LLM 的 Chrome 扩展程序，能够智能分析网页结构并提取用户需要的数据。只需描述你想要的数据类型，AI 会自动分析页面层级并提取。
+CrawlMind 是一款基于 DeepSeek LLM 的 Chrome/Edge 扩展程序，能够智能分析网页结构并提取用户需要的数据。只需描述你想要的数据类型，AI 会自动分析页面层级并提取。
 
 ## 功能特性
 
@@ -17,7 +17,7 @@ CrawlMind 是一款基于 DeepSeek LLM 的 Chrome 扩展程序，能够智能分
 ## 安装
 
 1. 克隆仓库到本地
-2. 打开 Chrome 扩展管理页面 (`chrome://extensions/`)
+2. 打开 Chrome/Edge 扩展管理页面 (`chrome://extensions/`/ `edge://extensions/`)
 3. 开启「开发者模式」
 4. 点击「加载已解压的扩展程序」
 5. 选择项目文件夹
