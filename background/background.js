@@ -134,43 +134,33 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
     let depthMatch = result.match(/"当前深度":\s*(\d+)/);
     let currentDepth = depthMatch ? parseInt(depthMatch[1]) : 0;
     
-    // 判断是否找到
-    if (result.includes('"是否找到": true') || result.includes('"是否找到":true') || result.includes('已找到')) {
-      // 提取层级路径
-      let layerPath = result.match(/"层级路径":\s*"([^"]+)"/)?.[1] || '';
-      let layerAttrs = result.match(/"包含的属性":\s*"([^"]+)"/)?.[1] || '';
-      sendProgressToPage(`✅ 层级分析找到目标层级: ${layerPath}`);
-      sendProgressToPage(`🏷️ 属性: ${layerAttrs}`);
-      sendProgressToPage('📥 正在根据该层级提取详细数据...');
-      
-      // 根据层级路径提取数据
-      return await extractByLayer(fullTreeText || treeText, userRequirement, layerPath, sendProgressToPage);
-    }
-
-    sendProgressToPage('🔄 层级未找到目标，先用5000字符提取看看...');
-    
-    // 先提取5000字符看看有没有数据（使用完整内容）
-    let initialResult = await getDetailedResult(fullTreeText || treeText, userRequirement, 5000, sendProgressToPage);
-    
-    // 检查是否包含目标数据（通过关键词判断）
-    const hasTargetData = initialResult && initialResult.length > 10 && 
-      !initialResult.includes('未找到') && !initialResult.includes('没有');
-    
-    if (hasTargetData) {
-      sendProgressToPage('✅ 5000字符提取到数据，继续获取更多...');
-      // 增加上限直到不再出现新数据
-      let moreResult = await getMoreResults(fullTreeText || treeText, userRequirement, 5000, sendProgressToPage);
-      return initialResult + '\n\n' + moreResult;
-    }
-    
-    sendProgressToPage('🔍 5000字符没找到明显数据，继续深度分析...');
-
-    // ====== 第二步：循环往下分析（使用完整内容） ======
+    // 无论是否找到，都进入循环验证流程
+    // ====== 第二步：循环往下分析 + 验证（使用完整内容） ======
     let offset = 0;
     let found = false;
     let allResults = [];
     let loopCount = 1;
     const fullContent = fullTreeText || treeText;
+    
+    // 尝试从层级分析得到的路径开始
+    let startLayerPath = '';
+    if (result.includes('"是否找到": true') || result.includes('"是否找到":true')) {
+      startLayerPath = result.match(/"层级路径":\s*"([^"]+)"/)?.[1] || '';
+      if (startLayerPath) {
+        sendProgressToPage(`✅ 层级分析找到目标层级: ${startLayerPath}`);
+        sendProgressToPage('📥 正在提取并验证...');
+        
+        // 提取并验证
+        let extractResult = await extractByLayer(fullContent, userRequirement, startLayerPath, sendProgressToPage);
+        
+        if (extractResult && extractResult.length > 10) {
+          found = true;
+          return extractResult;
+        }
+      }
+    }
+    
+    sendProgressToPage('🔄 开始循环验证查找...');
     
     // 从上一次分析的层级位置继续
     while (offset < fullContent.length) {
@@ -251,77 +241,113 @@ async function getDetailedResult(treeText, userRequirement, maxChars, sendProgre
 async function extractByLayer(treeText, userRequirement, layerPath, sendProgress) {
   sendProgress(`🎯 根据层级路径 "${layerPath}" 提取数据...`);
   
-  // 根据用户需求确定输出格式
-  let formatPrompt = '';
-  if (userRequirement.includes('商品名称') || userRequirement.includes('商品') || userRequirement.includes('产品')) {
-    formatPrompt = '每行格式: 商品1: xxx\n商品2: xxx';
-  } else if (userRequirement.includes('评论') || userRequirement.includes('评价')) {
-    formatPrompt = '每行格式: 评论1: xxx\n评论2: xxx';
-  } else if (userRequirement.includes('价格')) {
-    formatPrompt = '每行格式: 商品1: xxx - 价格: xxx\n商品2: xxx - 价格: xxx';
-  } else if (userRequirement.includes('图片')) {
-    formatPrompt = '每行格式: 图片1: xxx\n图片2: xxx';
-  } else {
-    formatPrompt = '每行格式: 数据1: xxx\n数据2: xxx';
-  }
+  // 让LLM根据用户需求自动判断输出格式
+  let formatMessages = [
+    { role: 'system', content: `你是格式分析专家。根据用户的提取需求，判断最合适的输出格式标签。
+
+用户需求示例和对应格式：
+- "商品名称" → "商品"
+- "评论内容" → "评论"  
+- "商品价格" → "商品"
+- "图片链接" → "图片"
+- "文章文本" → "段落"
+
+只输出一个最合适的标签，不要其他内容。` },
+    { role: 'user', content: `用户需求：${userRequirement}\n\n请判断输出格式标签是什么？` }
+  ];
   
-  let messages = [
-    { role: 'system', content: `你是网页数据提取专家。只输出提取的数据，不要解释。\n\n输出格式要求：\n${formatPrompt}\n\n每条数据单独一行，数字按顺序递增。` },
-    { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级路径：${layerPath}\n\nHTML完整内容：\n${treeText}\n\n请根据目标层级路径和用户需求提取数据，严格按照格式输出。` }
+  let formatLabel = await callLLM(formatMessages);
+  formatLabel = formatLabel.trim().replace(/[，。]/g, '');
+  
+  sendProgress(`📋 识别到数据类型: ${formatLabel}`);
+  
+  // 根据识别的格式标签构建输出格式
+  let formatPrompt = `${formatLabel}1: xxx\n${formatLabel}2: xxx\n${formatLabel}3: xxx`;
+  
+  // 第一次提取 - 使用较多字符（比如50000）
+  let firstExtractSize = 50000;
+  sendProgress(`📊 第一次提取 (前${firstExtractSize}字符)...`);
+  
+  let extractMessages = [
+    { role: 'system', content: `你是网页数据提取专家。只输出提取的数据，不要解释。\n\n重要：每个数据单独一行，不要放在同一行！\n\n输出格式示例：\n${formatPrompt}\n\n请严格按照格式输出，每个数据单独一行。` },
+    { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级路径：${layerPath}\n\nHTML内容：\n${treeText.substring(0, firstExtractSize)}\n\n请根据目标层级路径提取数据，每个数据单独一行！` }
   ];
   
   sendProgress('🤖 LLM正在根据层级提取数据...');
-  let result = await callLLM(messages);
-  sendProgress('✅ 层级数据提取完成');
+  let result = await callLLM(extractMessages);
+  sendProgress('✅ 数据提取完成，正在验证内容是否符合需求...');
   
-  // 继续获取更多数据
+  // 验证提取的内容是否符合用户需求
+  let verifyMessages = [
+    { role: 'system', content: `你是数据验证专家。判断提取的内容是否符合用户需求。
+
+判断标准：
+- 内容是否是用户想要的类型
+- 内容是否有意义（非空、非垃圾数据）
+
+只输出JSON格式：
+{"符合需求": true/false, "理由": "为什么符合/不符合"}` },
+    { role: 'user', content: `用户需求：${userRequirement}\n\n提取的内容：\n${result.substring(0, 2000)}\n\n请判断这些内容是否符合用户需求。` }
+  ];
+  
+  let verifyResult = await callLLM(verifyMessages);
+  sendProgress('📋 验证结果: ' + verifyResult.substring(0, 200));
+  
+  // 检查是否符合需求
+  let isValid = verifyResult.includes('"符合需求": true') || verifyResult.includes('"符合需求":true') || verifyResult.includes('符合需求": true');
+  
+  if (!isValid) {
+    sendProgress('⚠️ 提取的内容不符合需求，继续查找...');
+    // 返回空，让外层继续循环查找
+    return '';
+  }
+  
+  sendProgress('✅ 内容验证通过！');
+  
+  // 继续获取更多数据 - 从第一次提取结束的位置开始
   sendProgress('📥 继续获取更多数据...');
-  let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, sendProgress);
+  let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, firstExtractSize, sendProgress);
   
   return result + '\n\n' + moreResult;
 }
 
 // 根据层级继续获取更多数据
-async function getMoreResultsByLayer(treeText, userRequirement, layerPath, sendProgress) {
-  let offset = 0;
-  let maxChars = 10000;
+async function getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, startOffset, sendProgress) {
+  let maxChars = 20000;
   let allData = '';
   let moreCount = 1;
   
-  // 同样需要格式化
-  let formatPrompt = '';
-  if (userRequirement.includes('商品名称') || userRequirement.includes('商品') || userRequirement.includes('产品')) {
-    formatPrompt = '每行格式: 商品N: xxx';
-  } else if (userRequirement.includes('评论') || userRequirement.includes('评价')) {
-    formatPrompt = '每行格式: 评论N: xxx';
-  } else if (userRequirement.includes('价格')) {
-    formatPrompt = '每行格式: 商品N: xxx - 价格: xxx';
-  } else if (userRequirement.includes('图片')) {
-    formatPrompt = '每行格式: 图片N: xxx';
-  } else {
-    formatPrompt = '每行格式: 数据N: xxx';
-  }
+  // 使用已识别的格式标签
+  let formatPrompt = `${formatLabel}N: xxx (每个数据单独一行)`;
   
-  while (offset < treeText.length) {
-    sendProgress(`📥 继续获取第${moreCount}批数据...`);
+  while (startOffset < treeText.length) {
+    sendProgress(`📥 继续获取第${moreCount}批数据 (范围 ${startOffset}-${startOffset + maxChars})...`);
     
-    let segment = treeText.substring(offset, offset + maxChars);
+    let segment = treeText.substring(startOffset, startOffset + maxChars);
     if (!segment) break;
     
     let messages = [
-      { role: 'system', content: `提取数据，如果这个范围没有新数据返回"无更多数据"。\n\n格式要求：\n${formatPrompt}\n\n只输出数据，不要解释。` },
-      { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级：${layerPath}\n\nHTML：\n${segment}\n\n提取这个范围内新出现的数据，严格按照格式输出。` }
+      { role: 'system', content: `提取数据，如果这个范围没有新数据返回"无更多数据"。\n\n重要：每个数据单独一行输出！\n\n格式示例：\n${formatLabel}1: xxx\n${formatLabel}2: xxx\n\n只输出数据，不要解释。` },
+      { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级：${layerPath}\n\nHTML：\n${segment}\n\n提取这个范围内新出现的数据，每个单独一行！` }
     ];
     
     let result = await callLLM(messages);
+    sendProgress(`📥 第${moreCount}批提取完成，检查是否有更多...`);
+    
     if (result.includes('无更多数据') || result.includes('没有新数据')) {
       sendProgress('✅ 已获取所有数据');
       break;
     }
     
     allData += result + '\n';
-    offset += maxChars;
+    startOffset += maxChars;
     moreCount++;
+    
+    // 防止无限循环
+    if (moreCount > 50) {
+      sendProgress('⚠️已达最大提取次数');
+      break;
+    }
   }
   
   return allData;
