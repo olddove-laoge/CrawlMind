@@ -151,7 +151,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
         sendProgressToPage('📥 正在提取并验证...');
         
         // 提取并验证
-        let extractResult = await extractByLayer(fullContent, userRequirement, startLayerPath, sendProgressToPage);
+        let extractResult = await extractByLayer(fullContent, userRequirement, startLayerPath, tabId, sendProgressToPage);
         
         if (extractResult && extractResult.length > 10) {
           found = true;
@@ -192,7 +192,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
       
       // 根据层级路径提取数据
       sendProgressToPage('📥 根据该层级提取数据...');
-      let extractResult = await extractByLayer(fullContent, userRequirement, layerPath, sendProgressToPage);
+      let extractResult = await extractByLayer(fullContent, userRequirement, layerPath, tabId, sendProgressToPage);
       
       // 检查是否包含目标数据
       const hasTargetData2 = extractResult && extractResult.length > 10 && 
@@ -238,7 +238,7 @@ async function getDetailedResult(treeText, userRequirement, maxChars, sendProgre
 }
 
 // 根据层级路径提取数据
-async function extractByLayer(treeText, userRequirement, layerPath, sendProgress) {
+async function extractByLayer(treeText, userRequirement, layerPath, tabId, sendProgress) {
   sendProgress(`🎯 根据层级路径 "${layerPath}" 提取数据...`);
   
   // 让LLM根据用户需求自动判断输出格式
@@ -306,13 +306,13 @@ async function extractByLayer(treeText, userRequirement, layerPath, sendProgress
   
   // 继续获取更多数据 - 从第一次提取结束的位置开始
   sendProgress('📥 继续获取更多数据...');
-  let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, firstExtractSize, sendProgress);
+  let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, firstExtractSize, tabId, sendProgress);
   
   return result + '\n\n' + moreResult;
 }
 
 // 根据层级继续获取更多数据
-async function getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, startOffset, sendProgress) {
+async function getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, startOffset, tabId, sendProgress) {
   let maxChars = 20000;
   let allData = '';
   let moreCount = 1;
@@ -320,7 +320,18 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
   // 使用已识别的格式标签
   let formatPrompt = `${formatLabel}N: xxx (每个数据单独一行)`;
   
+  // 添加停止按钮
+  chrome.tabs.sendMessage(tabId, { action: 'addStopButton' }).catch(() => {});
+  
   while (startOffset < treeText.length) {
+    // 检查用户是否点击停止
+    const { stopExtract } = await chrome.storage.local.get('stopExtract');
+    if (stopExtract) {
+      sendProgress('⏹ 用户中断提取');
+      await chrome.storage.local.set({ stopExtract: false });
+      return allData; // 返回已爬取的数据
+    }
+    
     sendProgress(`📥 继续获取第${moreCount}批数据 (范围 ${startOffset}-${startOffset + maxChars})...`);
     
     let segment = treeText.substring(startOffset, startOffset + maxChars);

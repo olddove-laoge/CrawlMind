@@ -98,8 +98,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         div.textContent = request.message;
         container.appendChild(div);
         container.scrollTop = container.scrollHeight;
+        
+        // 如果提取完成或中断，恢复按钮状态
+        if (request.message.includes('已获取所有数据') || request.message.includes('用户中断') || request.message.includes('已达最大') || request.message.includes('提取完成')) {
+          document.getElementById('crawlmind-stop').style.display = 'none';
+          document.getElementById('crawlmind-send').style.display = 'block';
+        }
       }
     }, 100);
+  }
+  
+  // 添加停止按钮
+  if (request.action === 'addStopButton') {
+    addStopButton();
   }
   return true;
 });
@@ -172,6 +183,7 @@ function createChatPanel() {
       <input type="text" id="crawlmind-input" placeholder="请描述要爬取的数据..." 
         style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 20px; outline: none;">
       <button id="crawlmind-send" style="padding: 8px 16px; background: #667eea; color: white; border: none; border-radius: 20px; cursor: pointer;">发送</button>
+      <button id="crawlmind-stop" style="padding: 8px 12px; background: #f44336; color: white; border: none; border-radius: 20px; cursor: pointer; display: none;">停止</button>
     </div>
   `;
   
@@ -181,6 +193,7 @@ function createChatPanel() {
   document.getElementById('crawlmind-close').onclick = togglePanel;
   document.getElementById('crawlmind-send').onclick = sendMessage;
   document.getElementById('crawlmind-save-apikey').onclick = saveApiKey;
+  document.getElementById('crawlmind-stop').onclick = stopExtract;
   document.getElementById('crawlmind-input').onkeypress = (e) => {
     if (e.key === 'Enter') sendMessage();
   };
@@ -233,6 +246,36 @@ function saveApiKey() {
   }
 }
 
+function stopExtract() {
+  chrome.storage.local.set({ stopExtract: true }, () => {
+    addMessage('system', '⏹ 已发送停止信号...');
+  });
+}
+
+// 添加停止按钮到消息区域
+function addStopButton() {
+  const container = document.getElementById('crawlmind-messages');
+  if (!container) return;
+  
+  // 移除已有的停止按钮
+  const existing = container.querySelector('.stop-btn-container');
+  if (existing) existing.remove();
+  
+  const div = document.createElement('div');
+  div.className = 'stop-btn-container';
+  div.style.cssText = 'padding: 10px; text-align: center;';
+  div.innerHTML = `<button id="crawlmind-stop-batch" style="padding: 8px 24px; background: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer;">⏹ 停止爬取</button>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+  
+  document.getElementById('crawlmind-stop-batch').onclick = () => {
+    chrome.storage.local.set({ stopExtract: true });
+    addMessage('system', '⏹ 已停止爬取');
+    // 移除按钮
+    div.remove();
+  };
+}
+
 function sendMessage() {
   const input = document.getElementById('crawlmind-input');
   const apikeyInput = document.getElementById('crawlmind-apikey');
@@ -252,6 +295,9 @@ function sendMessage() {
   
   addMessage('user', message);
   input.value = '';
+  
+  // 重置停止标志
+  chrome.storage.local.set({ stopExtract: false });
   
   // 判断是否需要分析页面
   const keywords = ['爬取', '抓取', '采集', '获取', '提取', '数据', '商品', '评论', '价格', '标题', '内容', '链接', '图片'];
