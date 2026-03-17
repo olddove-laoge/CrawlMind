@@ -16,6 +16,28 @@ function traverseShadowDOM(hostElement, buildFunc, depth) {
   return result;
 }
 
+// 需要提取的属性列表
+const importantAttrs = [
+  'class', 'id', 'role',
+  'data-', 'aria-',
+  'href', 'src', 'link',
+  'itemprop', 'content', 'title', 'alt', 'name', 'value',
+  'type', 'action', 'method', 'placeholder'
+];
+
+function getImportantAttrs(element) {
+  const attrs = [];
+  for (const attr of element.attributes) {
+    for (const important of importantAttrs) {
+      if (attr.name === important || attr.name.startsWith(important)) {
+        attrs.push(`${attr.name}="${attr.value}"`);
+        break;
+      }
+    }
+  }
+  return attrs;
+}
+
 // 遍历DOM树，生成树形文本（仅框架结构）
 function buildTree(element, depth = 0) {
   const indent = '  '.repeat(depth);
@@ -24,14 +46,7 @@ function buildTree(element, depth = 0) {
   const skipTags = ['script', 'style', 'meta', 'noscript'];
   if (skipTags.includes(tagName)) return '';
   
-  const attrs = [];
-  for (const attr of element.attributes) {
-    if (attr.name === 'class' || attr.name === 'id' || 
-        attr.name.startsWith('data-') || attr.name === 'role') {
-      attrs.push(`${attr.name}="${attr.value}"`);
-    }
-  }
-  
+  const attrs = getImportantAttrs(element);
   const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';
   let result = `${indent}<${tagName}${attrStr}>\n`;
   
@@ -53,14 +68,7 @@ function buildFullTree(element, depth = 0) {
   const skipTags = ['script', 'style', 'meta', 'noscript'];
   if (skipTags.includes(tagName)) return '';
   
-  const attrs = [];
-  for (const attr of element.attributes) {
-    if (attr.name === 'class' || attr.name === 'id' || 
-        attr.name.startsWith('data-') || attr.name === 'role') {
-      attrs.push(`${attr.name}="${attr.value}"`);
-    }
-  }
-  
+  const attrs = getImportantAttrs(element);
   const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';
   const textContent = element.textContent.trim().substring(0, 200);
   const textPart = textContent ? ` [${textContent}]` : '';
