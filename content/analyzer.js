@@ -20,9 +20,7 @@ function traverseShadowDOM(hostElement, buildFunc, depth) {
 const importantAttrs = [
   'class', 'id', 'role',
   'data-', 'aria-',
-  'href', 'src', 'link',
-  'itemprop', 'content', 'title', 'alt', 'name', 'value',
-  'type', 'action', 'method', 'placeholder'
+  'href', 'src', 'link'
 ];
 
 function getImportantAttrs(element) {
