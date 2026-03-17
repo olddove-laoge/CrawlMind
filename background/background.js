@@ -104,8 +104,16 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
     }
     sendProgressToPage(`📄 页面结构已获取 (框架: ${treeText.length} 字符, 完整: ${fullTreeText?.length || 0} 字符)`);
 
-    // ====== 第一步：20000字符，层级分析 ======
+    // ====== 第一步：完整框架结构，层级分析 ======
     sendProgressToPage('🔍 正在分析页面层级结构 (1/3)...');
+    
+    // 限制框架长度，防止超出 API 上下文限制
+    const maxFrameworkChars = 80000;
+    let fullFramework = treeText;
+    if (fullFramework.length > maxFrameworkChars) {
+      fullFramework = fullFramework.substring(0, maxFrameworkChars) + `\n...[内容过长，已截断，剩余 ${treeText.length - maxFrameworkChars} 字符]`;
+    }
+    sendProgressToPage(`📄 已获取完整框架结构 (${fullFramework.length} 字符)`);
     
     let messages = [
       { role: 'system', content: `你是一个网页结构分析助手。根据用户需求"${userRequirement}"，分析HTML树形结构。
@@ -116,7 +124,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
 
 ---层级判断---
 {"层级路径": "如 div.product-list > ul > li", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false, "当前深度": 数字, "理由": "为什么选择这个层级"}` },
-      { role: 'user', content: `用户需求：${userRequirement}\n\nHTML结构（只显示标签和属性，不含文本内容）：\n${treeText.substring(0, 20000)}` }
+      { role: 'user', content: `用户需求：${userRequirement}\n\nHTML结构（完整框架，不含文本内容，共${fullFramework.length}字符）：\n${fullFramework}` }
     ];
     
     sendProgressToPage('🤖 LLM正在分析层级结构...');
@@ -140,6 +148,10 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
     let found = false;
     let allResults = [];
     let loopCount = 1;
+    let consecutiveFailures = 0;
+    let lastLayerPath = '';
+    let triedLayers = new Set();
+    let totalFailures = 0;  // 总失败次数
     const fullContent = fullTreeText || treeText;
     
     // 尝试从层级分析得到的路径开始
@@ -150,17 +162,26 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
         sendProgressToPage(`✅ 层级分析找到目标层级: ${startLayerPath}`);
         sendProgressToPage('📥 正在提取并验证...');
         
-        // 提取并验证
-        let extractResult = await extractByLayer(fullContent, userRequirement, startLayerPath, tabId, sendProgressToPage);
+        // 提取并验证（带offset）
+        let extractResult = await extractByLayer(fullContent, userRequirement, startLayerPath, tabId, sendProgressToPage, offset);
         
         if (extractResult && extractResult.length > 10) {
           found = true;
           return extractResult;
+        } else {
+          // 首次尝试失败，记录并继续
+          triedLayers.add(startLayerPath);
+          consecutiveFailures++;
+          totalFailures++;
+          sendProgressToPage(`⚠️ 首次尝试失败 (${totalFailures}次总失败)，继续寻找...`);
         }
       }
     }
     
     sendProgressToPage('🔄 开始循环验证查找...');
+    
+    // 快速跳过非商品区域
+    const skipKeywords = [];
     
     // 从上一次分析的层级位置继续
     while (offset < fullContent.length) {
@@ -169,7 +190,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
       let segment = fullContent.substring(offset, offset + 20000);
       if (!segment) break;
       
-      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}）：\n${segment}\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察哪些标签、属性可能包含目标数据]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "如 div.class", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
+      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}，当前偏移${offset}）：\n${segment}\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察是否包含具体的商品列表/商品名称。注意：如果只是导航菜单、分类链接、筛选条件等，不是真正的商品列表]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "如 div.class", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
       
       sendProgressToPage(`🤖 LLM正在分析深度${currentDepth + 1}...`);
       sendProgressToPage(`💭 思考中: 检查深度${currentDepth + 1}是否包含目标数据...`);
@@ -185,28 +206,201 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
       // 解析并显示层级信息
       let layerPath = result.match(/"层级路径":\s*"([^"]+)"/)?.[1] || '';
       let layerAttrs = result.match(/"包含的属性":\s*"([^"]+)"/)?.[1] || '';
+      let isFound = result.includes('"是否找到": true') || result.includes('"是否找到":true');
+      
       if (layerPath) {
         sendProgressToPage(`📍 当前深度${currentDepth + 1}可能层级: ${layerPath}`);
         sendProgressToPage(`🏷️ 该层级属性: ${layerAttrs}`);
       }
       
-      // 根据层级路径提取数据
+      // ====== 智能跳过非商品区域 ======
+      let shouldSkip = false;
+      for (let kw of skipKeywords) {
+        if (layerPath.toLowerCase().includes(kw.toLowerCase()) || 
+            loopAnalysisPart.toLowerCase().includes(kw.toLowerCase())) {
+          sendProgressToPage(`⏭ 跳过非商品区域 (${kw}): ${layerPath}`);
+          shouldSkip = true;
+          break;
+        }
+      }
+      
+      if (shouldSkip) {
+        offset += 20000;
+        currentDepth++;
+        loopCount++;
+        totalFailures++;
+        continue;
+      }
+      
+      // ====== 反思机制：连续5次或总失败10次时触发 ======
+      consecutiveFailures++;
+      totalFailures++;
+      
+      if (consecutiveFailures >= 5 || totalFailures >= 10) {
+        sendProgressToPage(`⚠️ 已连续失败 ${consecutiveFailures} 次 (共 ${totalFailures} 次)，触发反思机制...`);
+        
+        // 让LLM重新思考
+        let reflectionMessages = [
+          { role: 'system', content: `你是反思专家。之前选择的层级路径都没有找到真正的商品列表，你需要重新分析。
+
+已尝试过的路径：${Array.from(triedLayers).join(', ')}
+
+用户需求：${userRequirement}
+
+你需要：
+1. 重新分析HTML结构
+2. 找出可能包含真正商品列表的位置（注意：商品列表通常在页面中后部，可能需要滚动加载）
+3. 给出新的、更可能包含商品的层级路径
+
+重要：商品列表通常不在导航、筛选、分类区域，而是在主内容区域！` },
+          { role: 'user', content: `当前HTML片段（偏移${offset}）：
+${segment}
+
+请重新分析并给出一个新的、更可能包含商品列表的层级路径。格式：
+{"新的层级路径": "xxx", "理由": "为什么这个路径可能不同", "建议偏移量": 数字}` }
+        ];
+        
+        try {
+          let reflectionResult = await callLLM(reflectionMessages);
+          
+          // 提取新的路径和建议偏移量
+          let newPathMatch = reflectionResult.match(/"新的层级路径":\s*"([^"]+)"/);
+          let newOffsetMatch = reflectionResult.match(/"建议偏移量":\s*(\d+)/);
+          
+          if (newPathMatch) {
+            layerPath = newPathMatch[1];
+            sendProgressToPage(`🔄 反思后选择新路径: ${layerPath}`);
+            triedLayers.add(layerPath);
+          }
+          
+          // 如果LLM建议了新偏移量，直接跳转
+          if (newOffsetMatch) {
+            let suggestedOffset = parseInt(newOffsetMatch[1]);
+            if (suggestedOffset > offset) {
+              offset = suggestedOffset;
+              sendProgressToPage(`⏭ 反思建议跳转至偏移: ${offset}`);
+            }
+          }
+          
+          // 重置连续失败计数
+          consecutiveFailures = 0;
+        } catch (e) {
+          sendProgressToPage(`⚠️ 反思过程出错: ${e.message}`);
+        }
+      } else if (!triedLayers.has(layerPath)) {
+        triedLayers.add(layerPath);
+        lastLayerPath = layerPath;
+      }
+      
+      // 根据层级路径提取数据（使用当前offset）
       sendProgressToPage('📥 根据该层级提取数据...');
-      let extractResult = await extractByLayer(fullContent, userRequirement, layerPath, tabId, sendProgressToPage);
+      let extractResult = await extractByLayer(fullContent, userRequirement, layerPath, tabId, sendProgressToPage, offset);
+      
+      // 检查是否是用户拒绝
+      if (extractResult === 'USER_REJECTED') {
+        sendProgressToPage('❌ 用户拒绝数据，正在分析拒绝原因...');
+        
+        // 先分析用户拒绝的原因
+        let analyzeRejectMessages = [
+          { role: 'system', content: `你是分析专家。用户拒绝了你提取的数据，你需要分析可能的原因。
+
+分析维度：
+1. 数据类型不对？例如：要的是商品名称，却提取了分类名称
+2. 数据不完整？例如：只提取了部分
+3. 位置不对？例如：在错误的区域提取
+4. 格式不对？例如：格式不符合用户预期
+
+请简洁分析可能的原因。` },
+          { role: 'user', content: `用户需求：${userRequirement}
+之前提取时使用的层级路径：${layerPath}
+
+请分析用户拒绝的可能原因是什么？` }
+        ];
+        
+        let rejectReason = await callLLM(analyzeRejectMessages);
+        sendProgressToPage(`📋 拒绝原因分析: ${rejectReason.substring(0, 200)}`);
+        
+        // 然后基于原因反思
+        sendProgressToPage('🔄 反思机制启动...');
+        triedLayers.add(layerPath);
+        consecutiveFailures = 5;
+        totalFailures++;
+        
+        let reflectionMessages = [
+          { role: 'system', content: `你是反思专家。用户明确拒绝了你提取的数据。
+
+用户需求：${userRequirement}
+之前的层级路径：${layerPath}
+拒绝原因分析：${rejectReason}
+
+已尝试过的路径：${Array.from(triedLayers).join(', ')}
+
+你需要：
+1. 根据拒绝原因，重新分析HTML结构
+2. 找出真正包含用户所需数据的正确位置
+3. 给出新的层级路径和偏移量` },
+          { role: 'user', content: `请根据拒绝原因 "${rejectReason}" 重新分析。
+
+请给出：
+1. 新的层级路径
+2. 建议的偏移量（数字）
+
+格式：
+{"新的层级路径": "xxx", "理由": "xxx", "建议偏移量": 数字}` }
+        ];
+        
+        try {
+          let reflectionResult = await callLLM(reflectionMessages);
+          let newPathMatch = reflectionResult.match(/"新的层级路径":\s*"([^"]+)"/);
+          let newOffsetMatch = reflectionResult.match(/"建议偏移量":\s*(\d+)/);
+          
+          if (newPathMatch) {
+            layerPath = newPathMatch[1];
+            sendProgressToPage(`🔄 反思后选择新路径: ${layerPath}`);
+            triedLayers.add(layerPath);
+          }
+          
+          if (newOffsetMatch) {
+            offset = parseInt(newOffsetMatch[1]);
+            sendProgressToPage(`⏭ 反思建议跳转至偏移: ${offset}`);
+          }
+          
+          consecutiveFailures = 0;  // 重置
+          // 继续循环，不增加offset
+          continue;
+        } catch (e) {
+          sendProgressToPage(`⚠️ 反思出错: ${e.message}`);
+        }
+      }
       
       // 检查是否包含目标数据
       const hasTargetData2 = extractResult && extractResult.length > 10 && 
         !extractResult.includes('未找到') && !extractResult.includes('没有');
       
-      if (hasTargetData2) {
+      // 检查是否是成功提取完成（包括用户停止后的数据）
+      const isSuccessfullyExtracted = extractResult && extractResult.length > 10 && 
+        (extractResult.includes('已获取所有数据') || extractResult.includes('用户中断') || 
+         !extractResult.includes('未找到'));
+      
+      if (hasTargetData2 || isSuccessfullyExtracted) {
         found = true;
-        sendProgressToPage(`✅ 找到数据提取完成`);
+        sendProgressToPage(`✅ 数据提取完成，共 ${extractResult.length} 字符`);
         return extractResult;
+      } else {
+        consecutiveFailures++;
+        totalFailures++;
+        sendProgressToPage(`⚠️ 该位置未找到数据 (累计${totalFailures}次失败)，继续查找...`);
       }
       
       currentDepth++;
       offset += 20000;
       loopCount++;
+      
+      // 防止无限循环
+      if (loopCount > 50 || totalFailures > 50) {
+        sendProgressToPage('⚠️ 已达最大分析次数或失败次数过多');
+        break;
+      }
     }
     
     if (!found) {
@@ -237,9 +431,9 @@ async function getDetailedResult(treeText, userRequirement, maxChars, sendProgre
   return result;
 }
 
-// 根据层级路径提取数据
-async function extractByLayer(treeText, userRequirement, layerPath, tabId, sendProgress) {
-  sendProgress(`🎯 根据层级路径 "${layerPath}" 提取数据...`);
+// 根据层级路径提取数据（支持offset）
+async function extractByLayer(treeText, userRequirement, layerPath, tabId, sendProgress, startOffset = 0) {
+  sendProgress(`🎯 根据层级路径 "${layerPath}" 提取数据 (从位置${startOffset}开始)...`);
   
   // 让LLM根据用户需求自动判断输出格式
   let formatMessages = [
@@ -264,30 +458,56 @@ async function extractByLayer(treeText, userRequirement, layerPath, tabId, sendP
   // 根据识别的格式标签构建输出格式
   let formatPrompt = `${formatLabel}1: xxx\n${formatLabel}2: xxx\n${formatLabel}3: xxx`;
   
-  // 第一次提取 - 使用较多字符（比如50000）
+  // 第一次提取 - 从startOffset开始，使用较多字符（比如50000）
   let firstExtractSize = 50000;
-  sendProgress(`📊 第一次提取 (前${firstExtractSize}字符)...`);
+  let extractStart = startOffset;
+  sendProgress(`📊 第一次提取 (从${extractStart}开始，前${firstExtractSize}字符)...`);
   
   let extractMessages = [
-    { role: 'system', content: `你是网页数据提取专家。只输出提取的数据，不要解释。\n\n重要：每个数据单独一行，不要放在同一行！\n\n输出格式示例：\n${formatPrompt}\n\n请严格按照格式输出，每个数据单独一行。` },
-    { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级路径：${layerPath}\n\nHTML内容：\n${treeText.substring(0, firstExtractSize)}\n\n请根据目标层级路径提取数据，每个数据单独一行！` }
+    { role: 'system', content: `你是网页数据提取专家。只输出提取的数据，不要解释。
+
+⚠️ 重要：如果HTML中没有符合需求的数据，输出"无数据"，不要凭空创造！
+
+输出格式示例：
+${formatPrompt}
+
+如果没找到数据，只输出"无数据"不要输出其他内容。` },
+    { role: 'user', content: `用户需求：${userRequirement}
+
+目标层级路径：${layerPath}
+注意：只从位置 ${extractStart} 之后的HTML中提取，不要回头找前面的内容！
+
+HTML内容（从${extractStart}开始）：
+${treeText.substring(extractStart, extractStart + firstExtractSize)}
+
+请严格按照格式输出。每个数据单独一行。如果HTML中没有数据，输出"无数据"。` }
   ];
   
   sendProgress('🤖 LLM正在根据层级提取数据...');
   let result = await callLLM(extractMessages);
+  
+  // 检查是否返回"无数据"
+  if (result.includes('无数据') || result.trim() === '') {
+    sendProgress('⚠️ 该层级未找到数据，继续查找...');
+    return '';
+  }
+  
   sendProgress('✅ 数据提取完成，正在验证内容是否符合需求...');
   
-  // 验证提取的内容是否符合用户需求
+  // 验证提取的内容是否真实存在于HTML中（从相同位置验证）
   let verifyMessages = [
-    { role: 'system', content: `你是数据验证专家。判断提取的内容是否符合用户需求。
+    { role: 'system', content: `你是数据验证专家。判断提取的内容是否真实存在于HTML中。
 
-判断标准：
-- 内容是否是用户想要的类型
-- 内容是否有意义（非空、非垃圾数据）
+判断标准（满足任意一条即可）：
+1. 至少有部分数据真实出现在HTML中（不需要全部匹配）
+2. 内容是用户想要的类型
+3. 内容有实际意义（非空、非垃圾数据）
+
+注意：如果是分批次提取，后面批次的部分内容可能在当前HTML片段中找不到，这是正常的。
 
 只输出JSON格式：
-{"符合需求": true/false, "理由": "为什么符合/不符合"}` },
-    { role: 'user', content: `用户需求：${userRequirement}\n\n提取的内容：\n${result.substring(0, 2000)}\n\n请判断这些内容是否符合用户需求。` }
+{"符合需求": true/false, "理由": "为什么符合/不符合", "真实存在的数量": 数字}` },
+    { role: 'user', content: `用户需求：${userRequirement}\n\n提取的内容：\n${result.substring(0, 2000)}\n\n原始HTML（从位置${extractStart}开始，30000字符）：\n${treeText.substring(extractStart, extractStart + 30000)}\n\n请判断这些内容是否真实存在于上述HTML中。` }
   ];
   
   let verifyResult = await callLLM(verifyMessages);
@@ -298,15 +518,40 @@ async function extractByLayer(treeText, userRequirement, layerPath, tabId, sendP
   
   if (!isValid) {
     sendProgress('⚠️ 提取的内容不符合需求，继续查找...');
-    // 返回空，让外层继续循环查找
     return '';
   }
   
   sendProgress('✅ 内容验证通过！');
   
+  // ====== 用户确认机制 ======
+  sendProgress('⏸ 等待用户确认数据是否正确...');
+  
+  // 发送确认请求给content script
+  await new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { 
+      action: 'requestUserConfirm', 
+      data: result.substring(0, 1500),  // 截取部分数据展示
+      requirement: userRequirement
+    }, (response) => {
+      resolve(response?.confirmed ?? false);
+    });
+  });
+  
+  // 检查用户是否确认
+  const { userConfirmed } = await chrome.storage.local.get('userConfirmed');
+  await chrome.storage.local.set({ userConfirmed: false }); // 重置状态
+  
+  if (!userConfirmed) {
+    sendProgress('❌ 用户拒绝该数据，触发反思机制重新寻找...');
+    // 返回特殊标记让外层立即触发反思
+    return 'USER_REJECTED';
+  }
+  
+  sendProgress('✅ 用户确认数据正确，继续获取更多数据...');
+  
   // 继续获取更多数据 - 从第一次提取结束的位置开始
   sendProgress('📥 继续获取更多数据...');
-  let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, firstExtractSize, tabId, sendProgress);
+  let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, extractStart + firstExtractSize, tabId, sendProgress);
   
   return result + '\n\n' + moreResult;
 }

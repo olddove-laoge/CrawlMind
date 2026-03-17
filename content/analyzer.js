@@ -3,6 +3,19 @@
 let chatPanel = null;
 let isPanelOpen = false;
 
+// 遍历Shadow DOM的辅助函数
+function traverseShadowDOM(hostElement, buildFunc, depth) {
+  let result = '';
+  if (hostElement.shadowRoot) {
+    const shadowIndent = '  '.repeat(depth);
+    result += `${shadowIndent}<#shadow-root>\n`;
+    for (const child of hostElement.shadowRoot.children) {
+      result += buildFunc(child, depth + 1);
+    }
+  }
+  return result;
+}
+
 // 遍历DOM树，生成树形文本（仅框架结构）
 function buildTree(element, depth = 0) {
   const indent = '  '.repeat(depth);
@@ -25,6 +38,9 @@ function buildTree(element, depth = 0) {
   for (const child of element.children) {
     result += buildTree(child, depth + 1);
   }
+  
+  // 处理Shadow DOM
+  result += traverseShadowDOM(element, buildTree, depth);
   
   return result;
 }
@@ -53,6 +69,9 @@ function buildFullTree(element, depth = 0) {
   for (const child of element.children) {
     result += buildFullTree(child, depth + 1);
   }
+  
+  // 处理Shadow DOM
+  result += traverseShadowDOM(element, buildFullTree, depth);
   
   return result;
 }
@@ -111,6 +130,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // 添加停止按钮
   if (request.action === 'addStopButton') {
     addStopButton();
+  }
+  
+  // 用户确认请求
+  if (request.action === 'requestUserConfirm') {
+    showUserConfirmDialog(request.data, request.requirement, sendResponse);
+    return true; // 异步响应
   }
   return true;
 });
@@ -250,6 +275,58 @@ function stopExtract() {
   chrome.storage.local.set({ stopExtract: true }, () => {
     addMessage('system', '⏹ 已发送停止信号...');
   });
+}
+
+// 显示用户确认对话框
+function showUserConfirmDialog(data, requirement, sendResponse) {
+  const container = document.getElementById('crawlmind-messages');
+  if (!container) {
+    sendResponse({ confirmed: false });
+    return;
+  }
+  
+  // 确保面板打开
+  if (!isPanelOpen) {
+    togglePanel();
+  }
+  
+  // 移除已有的确认对话框
+  const existing = container.querySelector('.confirm-dialog');
+  if (existing) existing.remove();
+  
+  // 显示提取的数据预览
+  const dataPreview = document.createElement('div');
+  dataPreview.className = 'confirm-dialog';
+  dataPreview.style.cssText = 'padding: 12px; margin: 8px 0; background: #e3f2fd; border-radius: 8px; font-size: 13px; max-height: 200px; overflow-y: auto;';
+  dataPreview.innerHTML = `
+    <div style="font-weight: 600; margin-bottom: 8px;">📋 请确认这是您要的数据</div>
+    <div style="color: #666; margin-bottom: 8px;">需求: ${requirement}</div>
+    <div style="background: white; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-all;">${data}</div>
+    <div style="margin-top: 12px; display: flex; gap: 8px; justify-content: center;">
+      <button id="crawlmind-confirm-yes" style="padding: 8px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">✅ 正确</button>
+      <button id="crawlmind-confirm-no" style="padding: 8px 20px; background: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer;">❌ 不对</button>
+    </div>
+  `;
+  container.appendChild(dataPreview);
+  container.scrollTop = container.scrollHeight;
+  
+  // 绑定确认按钮
+  document.getElementById('crawlmind-confirm-yes').onclick = () => {
+    chrome.storage.local.set({ userConfirmed: true }, () => {
+      addMessage('system', '✅ 用户确认数据正确');
+      dataPreview.remove();
+      sendResponse({ confirmed: true });
+    });
+  };
+  
+  // 绑定拒绝按钮
+  document.getElementById('crawlmind-confirm-no').onclick = () => {
+    chrome.storage.local.set({ userConfirmed: false }, () => {
+      addMessage('system', '❌ 用户拒绝该数据，将重新寻找');
+      dataPreview.remove();
+      sendResponse({ confirmed: false });
+    });
+  };
 }
 
 // 添加停止按钮到消息区域
