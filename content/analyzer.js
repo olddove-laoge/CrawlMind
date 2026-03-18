@@ -166,7 +166,7 @@ function findPaginationCandidates() {
   const allElements = Array.from(document.querySelectorAll('*'));
   let补充 = 0;
   for (let i = allElements.length - 1; i >= 0; i--) {
-    if (candidates.length >= 30 || 补充 >= 20) break;
+    if (candidates.length >= 50 || 补充 >= 20) break;
     
     const el = allElements[i];
     const rect = el.getBoundingClientRect();
@@ -203,7 +203,7 @@ function findPaginationCandidates() {
     }
   }
   
-  return unique.slice(0, 30);
+  return unique.slice(0, 50);
 }
 
 // 尝试滚动容器
@@ -307,7 +307,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // 点击翻页按钮
   if (request.action === 'doClickPagination') {
     const { index } = request;
-    const pagination = findPagination();
+    const pagination = findPaginationCandidates();
     // 需要重新获取元素才能点击
     const allLinks = document.querySelectorAll('a, button, [role="button"]');
     if (pagination[index]) {
@@ -591,10 +591,10 @@ function testScrollAndPagination() {
             }
             
             if (clicked) {
-              alert('✅ 已点击翻页，2秒后重新检测...');
+              console.log('✅ 已点击翻页，2秒后重新检测...');
               setTimeout(testScrollAndPagination, 2000);
             } else {
-              alert('❌ 找不到翻页按钮');
+              console.log('❌ 找不到翻页按钮');
             }
           });
         });

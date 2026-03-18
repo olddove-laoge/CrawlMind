@@ -44,17 +44,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const candidates = request.candidates || [];
     
     const messages = [
-      { role: 'system', content: `你是网页元素分析专家。根据页面上下文，判断哪些元素是翻页按钮。
+      { role: 'system', content: `你是网页元素分析专家。根据页面上下文，判断哪些元素是"下一页"按钮。
 
-可能的翻页按钮特征：
-- 文本包含：下一页、Next、更多、加载更多、page、第X页、箭头（> >>）等
+重要的筛选规则：
+- 只识别"下一页"按钮，排除"上一页"、"上一页"、"previous"、"上一步"、"<"、"<<"等
+- 正确的下一页特征：文本包含"下一页"、"Next"、"下一页"、"更多"、"加载更多"、"page >"、">>"、"后一页"等
+- 错误的上一页特征：文本包含"上一页"、"上一页"、"previous"、"上一步"、"<"、<<"等
 - 位置：在页面底部或列表下方
 - 标签：通常是<a>、<button>或可点击的元素
 - 类名可能包含：page、pager、pagination、next、more、arrow等
 
-请从候选列表中筛选出真正的翻页按钮。
-只返回翻页按钮的索引编号，格式：1,3,5（用逗号分隔）
-如果不认为有任何翻页按钮，返回"无"` },
+请从候选列表中只筛选出"下一页"按钮。
+只返回下一页按钮的索引编号，格式：1,3,5（用逗号分隔）
+如果不认为有任何下一页按钮，返回"无"` },
       { role: 'user', content: `页面候选元素列表：\n${candidates.map((c, i) => `[${i}] <${c.tag}> "${c.text}" class="${c.class.substring(0, 30)}" id="${c.id}"`).join('\n')}\n\n请判断哪些是翻页按钮，只返回索引编号。` }
     ];
     
