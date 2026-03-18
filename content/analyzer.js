@@ -82,6 +82,142 @@ function buildFullTree(element, depth = 0) {
   return result;
 }
 
+// ==================== 滚动容器和翻页检测 ====================
+
+// 滚动容器检测
+function findScrollableContainers() {
+  const containers = [];
+  const allElements = document.querySelectorAll('*');
+  
+  for (const el of allElements) {
+    try {
+      const style = window.getComputedStyle(el);
+      const overflow = style.overflow;
+      const overflowY = style.overflowY;
+      const overflowX = style.overflowX;
+      
+      const isScrollable = 
+        overflow === 'auto' || overflow === 'scroll' ||
+        overflowY === 'auto' || overflowY === 'scroll' ||
+        overflowX === 'auto' || overflowX === 'scroll';
+      
+      if (isScrollable && el.scrollHeight > el.clientHeight) {
+        const rect = el.getBoundingClientRect();
+        containers.push({
+          element: el,
+          tag: el.tagName.toLowerCase(),
+          id: el.id || '',
+          class: el.className || '',
+          scrollHeight: el.scrollHeight,
+          clientHeight: el.clientHeight,
+          rect: { top: rect.top, left: rect.left, width: rect.width, height: rect.height }
+        });
+      }
+    } catch (e) {}
+  }
+  
+  return containers.sort((a, b) => b.rect.height - a.rect.height).slice(0, 20);
+}
+
+// 翻页检测 - 硬编码初筛 + LLM进一步判断
+function findPaginationCandidates() {
+  const candidates = [];
+  
+  // 1. 先用硬编码选择器快速初筛
+  const selectors = [
+    // 分页相关
+    '.pagination a', '.pagination button', '.pager a', '.pager button',
+    '.page-item a', '.page-item button',
+    '[class*="pagination"] a', '[class*="pagination"] button',
+    '[class*="pager"] a', '[class*="pager"] button',
+    '[id*="pagination"] a', '[id*="pagination"] button',
+    // 下一页/更多
+    'a.next', 'a[class*="next"]', 'button.next', 'button[class*="next"]',
+    'a.more', 'a[class*="more"]', 'button.more', 'button[class*="more"]',
+    'a.load-more', 'button.load-more',
+    // 页码
+    'a[href*="page"]', 'a[href*="p="]',
+    // 数字页码
+    '.page a', '.page-num a', '[class*="page-num"] a'
+  ];
+  
+  for (const selector of selectors) {
+    try {
+      const elements = document.querySelectorAll(selector);
+      for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 5 || rect.height < 5) continue;
+        
+        const text = el.textContent.trim();
+        if (!text) continue;
+        
+        candidates.push({
+          tag: el.tagName.toLowerCase(),
+          id: el.id || '',
+          class: el.className || '',
+          text: text.substring(0, 50),
+          href: el.href || ''
+        });
+      }
+    } catch (e) {}
+  }
+  
+  // 2. 再从后往前补充一些底部元素作为候选
+  const allElements = Array.from(document.querySelectorAll('*'));
+  let补充 = 0;
+  for (let i = allElements.length - 1; i >= 0; i--) {
+    if (candidates.length >= 30 || 补充 >= 20) break;
+    
+    const el = allElements[i];
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 30 || rect.height < 20) continue;
+    
+    const tag = el.tagName.toLowerCase();
+    if (tag !== 'a' && tag !== 'button') continue;
+    
+    const text = el.textContent.trim();
+    if (text.length < 1 || text.length > 20) continue;
+    
+    // 检查是否已存在
+    const exists = candidates.some(c => c.text === text);
+    if (!exists) {
+      candidates.push({
+        tag: tag,
+        id: el.id || '',
+        class: el.className || '',
+        text: text.substring(0, 50),
+        href: el.href || ''
+      });
+      补充++;
+    }
+  }
+  
+  // 去重
+  const unique = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    const key = c.tag + '|' + c.text.substring(0, 20);
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(c);
+    }
+  }
+  
+  return unique.slice(0, 30);
+}
+
+// 尝试滚动容器
+function scrollContainer(el) {
+  el.scrollTop = el.scrollHeight;
+  return true;
+}
+
+// 尝试点击翻页按钮
+function clickPagination(el) {
+  el.click();
+  return true;
+}
+
 const treeText = buildTree(document.body);
 const fullTreeText = buildFullTree(document.body);
 
@@ -143,6 +279,50 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     showUserConfirmDialog(request.data, request.requirement, sendResponse);
     return true; // 异步响应
   }
+  
+  // 滚动容器检测
+  if (request.action === 'findScrollable') {
+    const containers = findScrollableContainers();
+    sendResponse({ containers: containers });
+  }
+  
+  // 翻页候选元素检测（由LLM判断）
+  if (request.action === 'findPagination') {
+    const candidates = findPaginationCandidates();
+    sendResponse({ candidates: candidates });
+  }
+  
+  // 滚动容器
+  if (request.action === 'doScroll') {
+    const { index } = request;
+    const containers = findScrollableContainers();
+    if (containers[index]) {
+      scrollContainer(containers[index].element);
+      sendResponse({ success: true });
+    } else {
+      sendResponse({ success: false, error: '容器不存在' });
+    }
+  }
+  
+  // 点击翻页按钮
+  if (request.action === 'doClickPagination') {
+    const { index } = request;
+    const pagination = findPagination();
+    // 需要重新获取元素才能点击
+    const allLinks = document.querySelectorAll('a, button, [role="button"]');
+    if (pagination[index]) {
+      const text = pagination[index].text;
+      for (const el of allLinks) {
+        if (el.textContent.trim().substring(0, 50) === text) {
+          clickPagination(el);
+          sendResponse({ success: true });
+          return true;
+        }
+      }
+    }
+    sendResponse({ success: false, error: '按钮不存在' });
+  }
+  
   return true;
 });
 
@@ -203,10 +383,13 @@ function createChatPanel() {
       <span style="font-weight: 600;">CrawlMind AI</span>
       <span id="crawlmind-close" style="cursor: pointer; font-size: 18px;">×</span>
     </div>
-    <div id="crawlmind-settings" style="padding: 10px; border-bottom: 1px solid #eee; display: flex; gap: 8px;">
+    <div id="crawlmind-settings" style="padding: 10px; border-bottom: 1px solid #eee; display: flex; gap: 8px; flex-wrap: wrap;">
       <input type="text" id="crawlmind-apikey" placeholder="输入 DeepSeek API Key" 
-        style="flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 6px;">
+        style="flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 6px; min-width: 150px;">
       <button id="crawlmind-save-apikey" style="padding: 8px 12px; background: #4CAF50; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 12px;">保存</button>
+      <button id="crawlmind-test-scroll" style="padding: 8px 12px; background: #2196F3; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 12px;">测试滚动/翻页</button>
+    </div>
+    <div id="crawlmind-test-result" style="padding: 10px; border-bottom: 1px solid #eee; max-height: 150px; overflow-y: auto; background: #f9f9f9; font-size: 12px; display: none;">
     </div>
     <div id="crawlmind-messages" style="flex: 1; overflow-y: auto; padding: 10px; background: #f5f5f5;">
     </div>
@@ -225,6 +408,7 @@ function createChatPanel() {
   document.getElementById('crawlmind-send').onclick = sendMessage;
   document.getElementById('crawlmind-save-apikey').onclick = saveApiKey;
   document.getElementById('crawlmind-stop').onclick = stopExtract;
+  document.getElementById('crawlmind-test-scroll').onclick = testScrollAndPagination;
   document.getElementById('crawlmind-input').onkeypress = (e) => {
     if (e.key === 'Enter') sendMessage();
   };
@@ -280,6 +464,142 @@ function saveApiKey() {
 function stopExtract() {
   chrome.storage.local.set({ stopExtract: true }, () => {
     addMessage('system', '⏹ 已发送停止信号...');
+  });
+}
+
+// 测试滚动容器和翻页按钮检测
+function testScrollAndPagination() {
+  const resultDiv = document.getElementById('crawlmind-test-result');
+  resultDiv.style.display = 'block';
+  resultDiv.innerHTML = '<div style="color: #666;">🔍 正在检测...</div>';
+  
+  // 检测滚动容器
+  chrome.runtime.sendMessage({ action: 'findScrollable' }, (response) => {
+    const containers = response?.containers || [];
+    
+    // 获取翻页候选元素
+    chrome.runtime.sendMessage({ action: 'findPagination' }, (resp2) => {
+      const candidates = resp2?.candidates || [];
+      
+      // 调试信息
+      console.log('候选元素数量:', candidates.length);
+      
+      // 显示所有候选元素（用于调试）
+      let debugHtml = `<div style="margin:5px; padding:5px; background:#f0f0f0; font-size:11px;">调试: 候选元素${candidates.length}个</div>`;
+      
+      if (candidates.length > 0) {
+        debugHtml += '<div style="font-size:10px; max-height:100px; overflow:auto;">';
+        candidates.slice(0, 10).forEach((c, i) => {
+          debugHtml += `<div>[${i}] &lt;${c.tag}&gt; "${c.text.substring(0,30)}"</div>`;
+        });
+        debugHtml += '</div>';
+      }
+      
+      resultDiv.innerHTML = debugHtml + '<div style="color:#666;">🤖 LLM分析中...</div>';
+      
+      // 让LLM判断哪些是翻页按钮
+      chrome.runtime.sendMessage({ action: 'analyzePaginationCandidates', candidates: candidates }, (resp3) => {
+        const llmResult = resp3?.result || '';
+        const llmError = resp3?.error || '';
+        
+        console.log('LLM返回:', llmResult);
+        resultDiv.innerHTML = debugHtml + `<div style="margin:5px; padding:5px; background:#e0e0ff; font-size:11px;">LLM返回: ${llmResult || llmError}</div>`;
+        
+        // 解析LLM返回的索引
+        const paginationIndices = [];
+        if (llmResult && llmResult !== '无' && llmResult !== 'none') {
+          const matches = llmResult.match(/[\d,]+/g);
+          if (matches) {
+            matches[0].split(',').forEach(i => {
+              const idx = parseInt(i.trim());
+              if (!isNaN(idx) && idx >= 0 && idx < candidates.length) {
+                paginationIndices.push(idx);
+              }
+            });
+          }
+        }
+        
+        // 根据索引获取翻页按钮
+        const pagination = paginationIndices.map(i => candidates[i]).filter(Boolean);
+        
+        let html = '<div style="margin-bottom: 10px;"><strong>📜 滚动容器 (点击滚动):</strong></div>';
+        
+        if (containers.length === 0) {
+          html += '<div style="color: #999; margin-bottom: 10px;">未找到可滚动容器</div>';
+        } else {
+          containers.forEach((c, i) => {
+            html += `<div id="scroll-item-${i}" style="margin: 5px 0; padding: 5px; background: #e3f2fd; border-radius: 4px; cursor: pointer;">
+              [${i + 1}] &lt;${c.tag}&gt; #${c.id || '无ID'} .${c.class.substring(0, 20) || '无class'} 
+              (${Math.round(c.rect.width)}x${Math.round(c.rect.height)} 可滚动: ${c.scrollHeight - c.clientHeight}px)
+            </div>`;
+          });
+        }
+        
+        html += '<div style="margin: 10px 0;"><strong>🔄 翻页按钮 (LLM判断):</strong></div>';
+        
+        if (pagination.length === 0) {
+          html += '<div style="color: #999;">未找到翻页按钮</div>';
+        } else {
+          pagination.forEach((p, i) => {
+            html += `<div id="page-item-${i}" style="margin: 5px 0; padding: 5px; background: #fff3e0; border-radius: 4px; cursor: pointer;">
+              [${i + 1}] &lt;${p.tag}&gt; "${p.text}" 
+              ${p.href ? '(' + p.href.substring(0, 30) + '...)' : ''}
+            </div>`;
+          });
+        }
+        
+        resultDiv.innerHTML = html;
+        
+        // 绑定滚动点击事件
+        containers.forEach((c, i) => {
+          document.getElementById('scroll-item-' + i).addEventListener('click', () => {
+            chrome.runtime.sendMessage({ action: 'doScroll', index: i }, (r) => {
+              if (r?.success) {
+                alert('✅ 已滚动');
+              } else {
+                alert('❌ 滚动失败: ' + (r?.error || '未知错误'));
+              }
+            });
+          });
+        });
+        
+        // 绑定翻页点击事件
+        pagination.forEach((p, i) => {
+          document.getElementById('page-item-' + i).addEventListener('click', () => {
+            let clicked = false;
+            
+            // 方式1：尝试用选择器直接获取
+            const selectors = [
+              `button:contains('${p.text}')`,
+              `a:contains('${p.text}')`,
+              `button:contains('下一页')`,
+              `button:contains('更多')`,
+              `a:contains('下一页')`,
+              `a:contains('更多')`
+            ];
+            
+            // 方式2：遍历所有button和a
+            const allClickable = document.querySelectorAll('button, a, [role="button"]');
+            for (const el of allClickable) {
+              const elText = el.textContent.trim();
+              if (elText.includes('下一页') || elText.includes('更多') || elText.includes(p.text)) {
+                console.log('点击元素:', el.tagName, elText);
+                el.click();
+                clicked = true;
+                break;
+              }
+            }
+            
+            if (clicked) {
+              alert('✅ 已点击翻页，2秒后重新检测...');
+              setTimeout(testScrollAndPagination, 2000);
+            } else {
+              alert('❌ 找不到翻页按钮');
+            }
+          });
+        });
+      });
+    });
   });
 }
 

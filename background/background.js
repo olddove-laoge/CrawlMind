@@ -27,6 +27,44 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     return true;
   }
+  
+  // 滚动容器和翻页检测 - 转发到content script
+  if (['findScrollable', 'findPagination', 'doScroll', 'doClickPagination'].includes(request.action)) {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tabId = tabs[0].id;
+      chrome.tabs.sendMessage(tabId, request, (response) => {
+        sendResponse(response);
+      });
+    });
+    return true;
+  }
+  
+  // LLM分析翻页候选元素
+  if (request.action === 'analyzePaginationCandidates') {
+    const candidates = request.candidates || [];
+    
+    const messages = [
+      { role: 'system', content: `你是网页元素分析专家。根据页面上下文，判断哪些元素是翻页按钮。
+
+可能的翻页按钮特征：
+- 文本包含：下一页、Next、更多、加载更多、page、第X页、箭头（> >>）等
+- 位置：在页面底部或列表下方
+- 标签：通常是<a>、<button>或可点击的元素
+- 类名可能包含：page、pager、pagination、next、more、arrow等
+
+请从候选列表中筛选出真正的翻页按钮。
+只返回翻页按钮的索引编号，格式：1,3,5（用逗号分隔）
+如果不认为有任何翻页按钮，返回"无"` },
+      { role: 'user', content: `页面候选元素列表：\n${candidates.map((c, i) => `[${i}] <${c.tag}> "${c.text}" class="${c.class.substring(0, 30)}" id="${c.id}"`).join('\n')}\n\n请判断哪些是翻页按钮，只返回索引编号。` }
+    ];
+    
+    callLLM(messages).then(result => {
+      sendResponse({ result: result });
+    }).catch(err => {
+      sendResponse({ error: err.message });
+    });
+    return true;
+  }
 });
 
 // 闲聊模式
