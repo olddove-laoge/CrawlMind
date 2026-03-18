@@ -5,6 +5,8 @@ let globalScrollContainers = [];
 let globalPaginationButtons = [];
 let globalUserRequirement = '';
 let globalExtractedData = new Set(); // 已爬取的数据用于去重
+let globalSkipConfirm = false; // 反思后跳过确认
+let globalSelector = ''; // CSS选择器，用于快速提取数据
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('Background收到:', request);
@@ -661,6 +663,17 @@ ${treeText.substring(extractStart, extractStart + firstExtractSize)}
   
   sendProgress('✅ 用户确认数据正确，继续获取更多数据...');
   
+  // 如果还没有选择器，让LLM生成
+  if (!globalSelector && layerPath) {
+    sendProgress('🤖 正在生成CSS选择器...');
+    // 获取包含数据的HTML片段
+    const htmlSegment = treeText.substring(extractStart, extractStart + firstExtractSize);
+    globalSelector = await generateSelector(layerPath, userRequirement, htmlSegment, sendProgress);
+    if (globalSelector) {
+      sendProgress(`✅ CSS选择器已生成: ${globalSelector}`);
+    }
+  }
+  
   // 将已确认的数据加入全局去重集合
   const resultLines = result.split('\n').filter(l => l.trim());
   resultLines.forEach(line => globalExtractedData.add(line.trim().toLowerCase()));
@@ -692,6 +705,105 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
     lastPageUrl = tab.url;
   } catch (e) {}
   
+  // ====== 如果有选择器，直接一次性提取 ======
+  if (globalSelector) {
+    sendProgress(`🔍 使用选择器一次性提取所有数据...`);
+    
+    // 循环提取直到没有新数据
+    while (true) {
+      const { stopExtract } = await chrome.storage.local.get('stopExtract');
+      if (stopExtract) {
+        sendProgress('⏹ 用户中断提取');
+        await chrome.storage.local.set({ stopExtract: false });
+        break;
+      }
+      
+      const selectorData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
+      
+      if (!selectorData || selectorData.length === 0) {
+        sendProgress('⚠️ 选择器未提取到数据');
+        break;
+      }
+      
+      // 去重后格式化
+      const uniqueData = [];
+      for (const item of selectorData) {
+        const trimmed = item.trim().toLowerCase();
+        if (!globalExtractedData.has(trimmed)) {
+          globalExtractedData.add(trimmed);
+          uniqueData.push(item.trim());
+        }
+      }
+      
+      if (uniqueData.length === 0) {
+        sendProgress('✅ 所有数据已提取，无新数据');
+        break;
+      }
+      
+      const formatted = uniqueData.map((item, i) => `${formatLabel}${allData.split('\n').filter(l => l.trim()).length + i + 1}: ${item}`).join('\n');
+      allData += formatted + '\n';
+      sendProgress(`🔍 本次提取 ${uniqueData.length} 条数据，累计 ${allData.split('\n').filter(l => l.trim()).length} 条`);
+      
+      // 尝试滚动
+      if (globalScrollContainers.length > 0) {
+        sendProgress(`📜 尝试滚动加载更多...`);
+        for (let i = 0; i < globalScrollContainers.length; i++) {
+          const scrollResult = await chrome.tabs.sendMessage(tabId, { action: 'doScroll', index: i });
+          if (scrollResult?.success) {
+            sendProgress(`📜 已滚动，等待加载...`);
+            await new Promise(r => setTimeout(r, 1500));
+            break;
+          }
+        }
+      } else {
+        break;
+      }
+    }
+    
+    // 尝试翻页
+    if (globalPaginationButtons.length > 0 && allData) {
+      sendProgress('🔄 尝试翻页...');
+      
+      for (let i = 0; i < globalPaginationButtons.length; i++) {
+        const btn = globalPaginationButtons[i];
+        const clickResult = await chrome.tabs.sendMessage(tabId, { action: 'doClickPagination', text: btn.text });
+        
+        if (clickResult?.success) {
+          sendProgress(`🔄 已点击翻页按钮，等待加载...`);
+          await new Promise(r => setTimeout(r, 2000));
+          
+          let isNewPage = false;
+          try {
+            const tab = await chrome.tabs.get(tabId);
+            if (tab.url !== lastPageUrl) {
+              isNewPage = true;
+              lastPageUrl = tab.url;
+              sendProgress(`🔄 检测到新页面`);
+            }
+          } catch (e) {}
+          
+          if (!isNewPage) {
+            const newTree = await getFullPageTree(tabId);
+            if (newTree && newTree.length > treeText.length * 1.2) {
+              isNewPage = true;
+            }
+          }
+          
+          if (isNewPage) {
+            sendProgress('🔄 继续从新页面提取...');
+            // 递归继续提取
+            const moreData = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, 0, tabId, sendProgress);
+            allData += '\n' + moreData;
+            break;
+          }
+        }
+      }
+    }
+    
+    return allData;
+  }
+  
+  // ====== 没有选择器，用LLM分批提取（照旧） ======
   while (startOffset < treeText.length) {
     // 检查用户是否点击停止
     const { stopExtract } = await chrome.storage.local.get('stopExtract');
@@ -701,17 +813,33 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
       return allData;
     }
     
-    sendProgress(`📥 继续获取第${moreCount}批数据 (范围 ${startOffset}-${startOffset + maxChars})...`);
+    let result = '';
     
-    let segment = treeText.substring(startOffset, startOffset + maxChars);
-    if (!segment) break;
+    // 优先使用选择器提取
+    if (globalSelector) {
+      sendProgress(`🔍 使用选择器快速提取...`);
+      const selectorData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
+      if (selectorData && selectorData.length > 0) {
+        // 格式化数据
+        result = selectorData.map((item, i) => `${formatLabel}${i + 1}: ${item}`).join('\n');
+      }
+    }
     
-    let messages = [
-      { role: 'system', content: `提取数据，如果这个范围没有新数据返回"无更多数据"。\n\n重要：每个数据单独一行输出！\n\n格式示例：\n${formatLabel}1: xxx\n${formatLabel}2: xxx\n\n只输出数据，不要解释。` },
-      { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级：${layerPath}\n\nHTML：\n${segment}\n\n提取这个范围内新出现的数据，每个单独一行！` }
-    ];
+    // 如果选择器没提取到，用LLM
+    if (!result) {
+      sendProgress(`📥 继续获取第${moreCount}批数据 (范围 ${startOffset}-${startOffset + maxChars})...`);
+      
+      let segment = treeText.substring(startOffset, startOffset + maxChars);
+      if (!segment) break;
+      
+      let messages = [
+        { role: 'system', content: `提取数据，如果这个范围没有新数据返回"无更多数据"。\n\n重要：每个数据单独一行输出！\n\n格式示例：\n${formatLabel}1: xxx\n${formatLabel}2: xxx\n\n只输出数据，不要解释。` },
+        { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级：${layerPath}\n\nHTML：\n${segment}\n\n提取这个范围内新出现的数据，每个单独一行！` }
+      ];
+      
+      result = await callLLM(messages);
+    }
     
-    let result = await callLLM(messages);
     sendProgress(`📥 第${moreCount}批提取完成，检查是否有更多...`);
     
     if (result.includes('无更多数据') || result.includes('没有新数据')) {
@@ -730,16 +858,26 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
             sendProgress(`📜 已滚动容器 ${i + 1}，等待加载...`);
             await new Promise(r => setTimeout(r, 1500));
             
-            const newFullTree = await getFullPageTree(tabId);
-            if (newFullTree && newFullTree.length > treeText.length) {
-              const newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
-              if (newData && newData.length > 0) {
-                sendProgress(`📜 滚动后发现 ${newData.length} 个新数据`);
-                allData += newData + '\n';
-                treeText = newFullTree;
-                foundNewData = true;
-                break;
+            // 优先使用选择器提取
+            let newData = null;
+            if (globalSelector) {
+              newData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
+            }
+            
+            // 如果选择器没提取到，用LLM
+            if (!newData || newData.length === 0) {
+              const newFullTree = await getFullPageTree(tabId);
+              if (newFullTree && newFullTree.length > treeText.length) {
+                newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
               }
+            }
+            
+            if (newData && newData.length > 0) {
+              sendProgress(`📜 滚动后发现 ${newData.length} 个新数据`);
+              allData += newData + '\n';
+              treeText = await getFullPageTree(tabId);
+              foundNewData = true;
+              break;
             }
           }
         }
@@ -783,13 +921,22 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
             }
             
             if (isNewPage) {
-              const newFullTree = await getFullPageTree(tabId);
-              const newData = await extractNewData(newFullTree, 0, userRequirement, layerPath, formatLabel, sendProgress);
+              // 优先使用选择器提取
+              let newData = null;
+              if (globalSelector) {
+                newData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
+              }
+              
+              // 如果选择器没提取到，用LLM
+              if (!newData || newData.length === 0) {
+                const newFullTree = await getFullPageTree(tabId);
+                newData = await extractNewData(newFullTree, 0, userRequirement, layerPath, formatLabel, sendProgress);
+              }
               
               if (newData && newData.length > 0) {
                 sendProgress(`🔄 翻页后发现 ${newData.length} 个新数据`);
                 allData += newData + '\n';
-                treeText = newFullTree;
+                treeText = await getFullPageTree(tabId);
                 startOffset = 0;
                 foundNewData = true;
                 
@@ -1102,4 +1249,62 @@ async function extractNewDataWithPath(treeText, startOffset, userRequirement, la
   
   let result = await callLLM(messages);
   return await deduplicateData(result, '', sendProgress);
+}
+
+// 生成CSS选择器
+async function generateSelector(layerPath, userRequirement, htmlSegment, sendProgress) {
+  const messages = [
+    { role: 'system', content: `你是一个CSS选择器生成专家。根据用户需求和实际HTML代码，生成可以直接在document.querySelectorAll中使用的CSS选择器。
+
+要求：
+1. 只输出CSS选择器，不要其他内容
+2. 选择器要能选中包含目标数据的元素
+3. 如果HTML中元素有class，用.class形式；如果有id，用#id形式
+4. 优先使用class选择器，class名要完整匹配
+5. 多层级用 > 连接
+6. 选择器要尽量精确，避免选中不需要的元素
+
+例如：
+HTML片段: <div class="product-list"><ul><li class="item">商品名称</li></ul></div>
+用户需求: 爬取商品名称
+输出: div.product-list ul li.item` },
+    { role: 'user', content: `用户需求：${userRequirement}
+层级路径：${layerPath}
+
+HTML片段（包含实际数据）：
+${htmlSegment.substring(0, 5000)}
+
+请根据以上HTML片段生成CSS选择器，只输出选择器本身，不要其他内容。` }
+  ];
+  
+  try {
+    const selector = await callLLM(messages);
+    return selector.trim();
+  } catch (e) {
+    sendProgress(`⚠️ 生成选择器失败: ${e.message}`);
+    return '';
+  }
+}
+
+// 使用选择器快速提取数据
+async function extractBySelector(tabId, userRequirement, formatLabel, sendProgress) {
+  if (!globalSelector) {
+    return null;
+  }
+  
+  sendProgress(`🔍 使用选择器快速提取: ${globalSelector}`);
+  
+  // 在content script中执行选择器
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, {
+      action: 'extractBySelector',
+      selector: globalSelector
+    }, (response) => {
+      if (response && response.data) {
+        resolve(response.data);
+      } else {
+        resolve(null);
+      }
+    });
+  });
 }

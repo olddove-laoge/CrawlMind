@@ -367,6 +367,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   
+  // 使用选择器快速提取数据
+  if (request.action === 'extractBySelector') {
+    const selector = request.selector;
+    try {
+      const elements = document.querySelectorAll(selector);
+      const data = [];
+      for (const el of elements) {
+        const text = el.textContent.trim();
+        if (text) {
+          data.push(text);
+        }
+      }
+      sendResponse({ data: data });
+    } catch (e) {
+      sendResponse({ error: e.message });
+    }
+    return true;
+  }
+  
   return true;
 });
 
