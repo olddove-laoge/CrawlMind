@@ -396,6 +396,7 @@ ${segment}
           consecutiveFailures = 0;
         } catch (e) {
           sendProgressToPage(`⚠️ 反思过程出错: ${e.message}`);
+          continue;
         }
       } else if (!triedLayers.has(layerPath)) {
         triedLayers.add(layerPath);
@@ -480,6 +481,7 @@ ${segment}
           continue;
         } catch (e) {
           sendProgressToPage(`⚠️ 反思出错: ${e.message}`);
+          continue;
         }
       }
       
