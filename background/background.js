@@ -1,5 +1,11 @@
 // background/background.js - 后台脚本
 
+// 全局变量存储滚动容器和翻页按钮
+let globalScrollContainers = [];
+let globalPaginationButtons = [];
+let globalUserRequirement = '';
+let globalExtractedData = new Set(); // 已爬取的数据用于去重
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('Background收到:', request);
   
@@ -124,6 +130,63 @@ async function callLLM(messages) {
   return data.choices[0].message.content;
 }
 
+// 检测滚动容器和翻页按钮
+async function detectScrollAndPagination(tabId, sendProgress) {
+  // 检测滚动容器
+  const scrollResponse = await chrome.tabs.sendMessage(tabId, { action: 'findScrollable' });
+  const scrollContainers = scrollResponse?.containers || [];
+  sendProgress(`📜 检测到 ${scrollContainers.length} 个滚动容器`);
+  
+  // 检测翻页候选元素
+  const paginationResponse = await chrome.tabs.sendMessage(tabId, { action: 'findPagination' });
+  const candidates = paginationResponse?.candidates || [];
+  
+  // 让 LLM 判断哪些是下一页按钮
+  let paginationButtons = [];
+  if (candidates.length > 0) {
+    const messages = [
+      { role: 'system', content: `你是网页元素分析专家。根据页面上下文，判断哪些元素是"下一页"按钮。
+
+重要的筛选规则：
+- 只识别"下一页"按钮，排除"上一页"、"上一页"、"previous"、"上一步"、"<"、"<<"等
+- 正确的下一页特征：文本包含"下一页"、"Next"、"下一页"、"更多"、"加载更多"、"page >"、">>"、"后一页"等
+- 错误的上一页特征：文本包含"上一页"、"上一页"、"previous"、"上一步"、"<"、<<"等
+- 位置：在页面底部或列表下方
+- 标签：通常是<a>、<button>或可点击的元素
+- 类名可能包含：page、pager、pagination、next、more、arrow等
+
+请从候选列表中只筛选出"下一页"按钮。
+只返回下一页按钮的索引编号，格式：1,3,5（用逗号分隔）
+如果不认为有任何下一页按钮，返回"无"` },
+      { role: 'user', content: `页面候选元素列表：\n${candidates.map((c, i) => `[${i}] <${c.tag}> "${c.text}" class="${c.class.substring(0, 30)}" id="${c.id}"`).join('\n')}\n\n请判断哪些是翻页按钮，只返回索引编号。` }
+    ];
+    
+    const llmResult = await callLLM(messages);
+    const llmResultStr = llmResult || '';
+    
+    // 解析 LLM 返回的索引
+    const paginationIndices = [];
+    if (llmResultStr && llmResultStr !== '无' && llmResultStr !== 'none') {
+      const matches = llmResultStr.match(/[\d,]+/g);
+      if (matches) {
+        matches[0].split(',').forEach(i => {
+          const idx = parseInt(i.trim());
+          if (!isNaN(idx) && idx >= 0 && idx < candidates.length) {
+            paginationIndices.push(idx);
+          }
+        });
+      }
+    }
+    
+    paginationButtons = paginationIndices.map(i => candidates[i]).filter(Boolean);
+    sendProgress(`🔄 检测到 ${paginationButtons.length} 个下一页按钮`);
+  } else {
+    sendProgress(`🔄 未检测到翻页候选元素`);
+  }
+  
+  return { scrollContainers, paginationButtons };
+}
+
 // 分析策略：分层提取
 async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgress) {
   try {
@@ -135,6 +198,13 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
         console.log('发送失败:', err);
       });
     };
+    
+    // ====== 第一步：检测滚动容器和翻页按钮 ======
+    sendProgressToPage('🔍 正在检测滚动容器和翻页按钮...');
+    const { scrollContainers, paginationButtons } = await detectScrollAndPagination(tabId, sendProgressToPage);
+    globalScrollContainers = scrollContainers;
+    globalPaginationButtons = paginationButtons;
+    globalUserRequirement = userRequirement;
     
     // 获取完整内容树（用于数据提取）
     sendProgressToPage('📄 正在获取页面完整内容...');
@@ -589,6 +659,11 @@ ${treeText.substring(extractStart, extractStart + firstExtractSize)}
   
   sendProgress('✅ 用户确认数据正确，继续获取更多数据...');
   
+  // 将已确认的数据加入全局去重集合
+  const resultLines = result.split('\n').filter(l => l.trim());
+  resultLines.forEach(line => globalExtractedData.add(line.trim().toLowerCase()));
+  sendProgress(`🔄 已将 ${resultLines.length} 条数据加入去重集合`);
+  
   // 继续获取更多数据 - 从第一次提取结束的位置开始
   sendProgress('📥 继续获取更多数据...');
   let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, extractStart + firstExtractSize, tabId, sendProgress);
@@ -601,6 +676,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
   let maxChars = 20000;
   let allData = '';
   let moreCount = 1;
+  let lastPageUrl = '';
   
   // 使用已识别的格式标签
   let formatPrompt = `${formatLabel}N: xxx (每个数据单独一行)`;
@@ -608,13 +684,19 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
   // 添加停止按钮
   chrome.tabs.sendMessage(tabId, { action: 'addStopButton' }).catch(() => {});
   
+  // 获取初始页面URL
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    lastPageUrl = tab.url;
+  } catch (e) {}
+  
   while (startOffset < treeText.length) {
     // 检查用户是否点击停止
     const { stopExtract } = await chrome.storage.local.get('stopExtract');
     if (stopExtract) {
       sendProgress('⏹ 用户中断提取');
       await chrome.storage.local.set({ stopExtract: false });
-      return allData; // 返回已爬取的数据
+      return allData;
     }
     
     sendProgress(`📥 继续获取第${moreCount}批数据 (范围 ${startOffset}-${startOffset + maxChars})...`);
@@ -631,22 +713,303 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
     sendProgress(`📥 第${moreCount}批提取完成，检查是否有更多...`);
     
     if (result.includes('无更多数据') || result.includes('没有新数据')) {
-      sendProgress('✅ 已获取所有数据');
-      break;
+      // ====== 尝试滚动或翻页 ======
+      sendProgress('⚠️ 当前页无更多数据，尝试滚动或翻页...');
+      
+      let foundNewData = false;
+      
+      // 1. 尝试滚动滚动容器
+      if (globalScrollContainers.length > 0) {
+        sendProgress(`📜 尝试滚动 ${globalScrollContainers.length} 个滚动容器...`);
+        
+        for (let i = 0; i < globalScrollContainers.length; i++) {
+          const scrollResult = await chrome.tabs.sendMessage(tabId, { action: 'doScroll', index: i });
+          if (scrollResult?.success) {
+            sendProgress(`📜 已滚动容器 ${i + 1}，等待加载...`);
+            await new Promise(r => setTimeout(r, 1500));
+            
+            const newFullTree = await getFullPageTree(tabId);
+            if (newFullTree && newFullTree.length > treeText.length) {
+              const newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
+              if (newData && newData.length > 0) {
+                sendProgress(`📜 滚动后发现 ${newData.length} 个新数据`);
+                allData += newData + '\n';
+                treeText = newFullTree;
+                foundNewData = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+      
+      // 2. 如果滚动没用，尝试翻页
+      if (!foundNewData && globalPaginationButtons.length > 0) {
+        sendProgress(`🔄 尝试点击翻页按钮...`);
+        
+        for (let i = 0; i < globalPaginationButtons.length; i++) {
+          const btn = globalPaginationButtons[i];
+          const clickResult = await chrome.tabs.sendMessage(tabId, { action: 'doClickPagination', text: btn.text });
+          
+          if (clickResult?.success) {
+            sendProgress(`🔄 已点击翻页按钮 ${i + 1}，等待加载...`);
+            await new Promise(r => setTimeout(r, 2000));
+            
+            // 检测是否真的到了新页面
+            let isNewPage = false;
+            let newPageUrl = '';
+            try {
+              const tab = await chrome.tabs.get(tabId);
+              newPageUrl = tab.url;
+              if (tab.url !== lastPageUrl) {
+                isNewPage = true;
+                lastPageUrl = tab.url;
+                sendProgress(`🔄 检测到新页面: ${tab.url.substring(0, 50)}...`);
+              }
+            } catch (e) {}
+            
+            // 如果没有URL变化，检测DOM变化（必须比原来大很多才算）
+            if (!isNewPage) {
+              const newFullTree = await getFullPageTree(tabId);
+              // 必须是原来的 1.2 倍以上才算真正有新内容
+              if (newFullTree && newFullTree.length > treeText.length * 1.2) {
+                isNewPage = true;
+                sendProgress(`🔄 DOM内容明显增加: ${treeText.length} → ${newFullTree.length}`);
+              } else {
+                sendProgress(`⚠️ 页面长度未明显变化: ${treeText.length} → ${newFullTree?.length || 0}`);
+              }
+            }
+            
+            if (isNewPage) {
+              const newFullTree = await getFullPageTree(tabId);
+              const newData = await extractNewData(newFullTree, 0, userRequirement, layerPath, formatLabel, sendProgress);
+              
+              if (newData && newData.length > 0) {
+                sendProgress(`🔄 翻页后发现 ${newData.length} 个新数据`);
+                allData += newData + '\n';
+                treeText = newFullTree;
+                startOffset = 0;
+                foundNewData = true;
+                
+                // 重新检测翻页按钮
+                sendProgress('🔄 重新检测翻页按钮...');
+                const { paginationButtons } = await detectScrollAndPagination(tabId, sendProgress);
+                globalPaginationButtons = paginationButtons;
+                
+                break;
+              } else {
+                sendProgress('⚠️ 翻页后未发现新数据');
+              }
+            } else {
+              sendProgress('⚠️ 翻页后页面未变化');
+            }
+          }
+        }
+      }
+      
+      if (foundNewData) {
+        moreCount = 1;
+        continue;
+      } else {
+        sendProgress('✅ 已获取所有数据（滚动和翻页均无新数据）');
+        break;
+      }
     }
     
-    allData += result + '\n';
+    // 去重检测
+    const uniqueResult = await deduplicateData(result, allData, sendProgress);
+    if (uniqueResult && uniqueResult.length > 0) {
+      allData += uniqueResult + '\n';
+      const lines = uniqueResult.split('\n').filter(l => l.trim());
+      lines.forEach(line => globalExtractedData.add(line.trim().toLowerCase()));
+    }
+    
     startOffset += maxChars;
     moreCount++;
     
-    // 防止无限循环
     if (moreCount > 50) {
-      sendProgress('⚠️已达最大提取次数');
+      sendProgress('⚠️ 已达最大提取次数');
       break;
     }
   }
   
+  // 页面内容已提取完，尝试滚动或翻页加载更多
+  sendProgress('⚠️ 页面内容已提取完，尝试滚动或翻页加载更多...');
+  
+  let foundNewData = false;
+  
+  // 1. 尝试滚动滚动容器
+  if (globalScrollContainers.length > 0) {
+    sendProgress(`📜 尝试滚动 ${globalScrollContainers.length} 个滚动容器...`);
+    
+    for (let i = 0; i < globalScrollContainers.length; i++) {
+      const scrollResult = await chrome.tabs.sendMessage(tabId, { action: 'doScroll', index: i });
+      if (scrollResult?.success) {
+        sendProgress(`📜 已滚动容器 ${i + 1}，等待加载...`);
+        await new Promise(r => setTimeout(r, 2000));
+        
+        const newFullTree = await getFullPageTree(tabId);
+        if (newFullTree && newFullTree.length > treeText.length) {
+          const newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
+          if (newData && newData.length > 0) {
+            sendProgress(`📜 滚动后发现新数据，继续提取...`);
+            allData += newData + '\n';
+            treeText = newFullTree;
+            startOffset = treeText.length;
+            foundNewData = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+  
+  // 2. 如果滚动没用，尝试翻页
+  if (!foundNewData && globalPaginationButtons.length > 0) {
+    sendProgress(`🔄 尝试点击翻页按钮...`);
+    
+    for (let i = 0; i < globalPaginationButtons.length; i++) {
+      const btn = globalPaginationButtons[i];
+      const clickResult = await chrome.tabs.sendMessage(tabId, { action: 'doClickPagination', text: btn.text });
+      
+      if (clickResult?.success) {
+        sendProgress(`🔄 已点击翻页按钮 ${i + 1}，等待加载...`);
+        await new Promise(r => setTimeout(r, 2000));
+        
+        let isNewPage = false;
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.url !== lastPageUrl) {
+            isNewPage = true;
+            lastPageUrl = tab.url;
+            sendProgress(`🔄 检测到新页面: ${tab.url.substring(0, 50)}...`);
+          }
+        } catch (e) {}
+        
+        if (!isNewPage) {
+          const newFullTree = await getFullPageTree(tabId);
+          if (newFullTree && newFullTree.length > treeText.length * 0.5) {
+            isNewPage = true;
+          }
+        }
+        
+        if (isNewPage) {
+          const newFullTree = await getFullPageTree(tabId);
+          
+          // 翻页后需要重新检测层级路径
+          sendProgress('🔄 翻页后重新分析页面结构...');
+          const newLayerPath = await detectLayerPath(newFullTree, userRequirement, sendProgress);
+          
+          if (newLayerPath) {
+            sendProgress(`🔄 新页面层级路径: ${newLayerPath}`);
+            // 从新页面开头提取数据
+            const newData = await extractNewDataWithPath(newFullTree, 0, userRequirement, newLayerPath, formatLabel, sendProgress);
+            
+            if (newData && newData.length > 0) {
+              sendProgress(`🔄 翻页后发现 ${newData.length} 个新数据`);
+              allData += newData + '\n';
+              treeText = newFullTree;
+              layerPath = newLayerPath; // 更新层级路径
+              startOffset = treeText.length;
+              foundNewData = true;
+              
+              sendProgress('🔄 重新检测翻页按钮...');
+              const { paginationButtons } = await detectScrollAndPagination(tabId, sendProgress);
+              globalPaginationButtons = paginationButtons;
+              
+              break;
+            } else {
+              sendProgress('⚠️ 翻页后未发现新数据');
+            }
+          } else {
+            sendProgress('⚠️ 无法确定新页面层级路径');
+          }
+        } else {
+          sendProgress('⚠️ 翻页后页面未变化');
+        }
+      }
+    }
+  }
+  
+  if (foundNewData) {
+    sendProgress('📥 继续从新页面提取数据...');
+    // 继续提取直到没有新数据
+    while (startOffset < treeText.length) {
+      const { stopExtract } = await chrome.storage.local.get('stopExtract');
+      if (stopExtract) {
+        sendProgress('⏹ 用户中断提取');
+        await chrome.storage.local.set({ stopExtract: false });
+        break;
+      }
+      
+      sendProgress(`📥 继续获取数据 (范围 ${startOffset}-${startOffset + maxChars})...`);
+      
+      let segment = treeText.substring(startOffset, startOffset + maxChars);
+      if (!segment) break;
+      
+      let messages = [
+        { role: 'system', content: `提取数据，如果这个范围没有新数据返回"无更多数据"。\n\n格式示例：\n${formatLabel}1: xxx\n${formatLabel}2: xxx\n\n只输出数据，不要解释。` },
+        { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级：${layerPath}\n\nHTML：\n${segment}\n\n提取这个范围内新出现的数据！` }
+      ];
+      
+      let result = await callLLM(messages);
+      
+      if (result.includes('无更多数据') || result.includes('没有新数据')) {
+        break;
+      }
+      
+      const uniqueResult = await deduplicateData(result, allData, sendProgress);
+      if (uniqueResult && uniqueResult.length > 0) {
+        allData += uniqueResult + '\n';
+      }
+      
+      startOffset += maxChars;
+    }
+  }
+  
   return allData;
+}
+
+// 提取新数据（与已爬取数据去重）
+async function extractNewData(newTreeText, startOffset, userRequirement, layerPath, formatLabel, sendProgress) {
+  const segment = newTreeText.substring(startOffset, startOffset + 20000);
+  if (!segment) return '';
+  
+  let messages = [
+    { role: 'system', content: `提取新数据，如果这个范围没有新数据返回"无更多数据"。\n\n重要：每个数据单独一行输出！\n\n格式示例：\n${formatLabel}1: xxx\n${formatLabel}2: xxx\n\n只输出数据，不要解释。` },
+    { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级：${layerPath}\n\nHTML：\n${segment}\n\n提取这个范围内新出现的数据，每个单独一行！` }
+  ];
+  
+  let result = await callLLM(messages);
+  return await deduplicateData(result, '', sendProgress);
+}
+
+// 去重函数
+async function deduplicateData(newData, existingData, sendProgress) {
+  if (!newData || newData.includes('无更多数据') || newData.includes('没有新数据')) {
+    return '';
+  }
+  
+  const newLines = newData.split('\n').filter(l => l.trim());
+  const existingLines = existingData.split('\n').filter(l => l.trim());
+  
+  const existingSet = new Set(existingLines.map(l => l.trim().toLowerCase()));
+  const globalSet = globalExtractedData;
+  
+  const uniqueLines = [];
+  for (const line of newLines) {
+    const trimmed = line.trim().toLowerCase();
+    if (!existingSet.has(trimmed) && !globalSet.has(trimmed)) {
+      uniqueLines.push(line.trim());
+      globalSet.add(trimmed);
+    }
+  }
+  
+  if (uniqueLines.length < newLines.length) {
+    sendProgress(`🔄 去重过滤了 ${newLines.length - uniqueLines.length} 个重复数据`);
+  }
+  
+  return uniqueLines.join('\n');
 }
 
 // 找到后，继续获取更多数据 - 每次增加5000直到无新数据
@@ -696,4 +1059,45 @@ async function getFullPageTree(tabId) {
       resolve(response?.treeText || null);
     });
   });
+}
+
+// 检测新页面的层级路径
+async function detectLayerPath(treeText, userRequirement, sendProgress) {
+  const maxChars = 30000;
+  const segment = treeText.substring(0, maxChars);
+  
+  const messages = [
+    { role: 'system', content: `你是一个网页结构分析助手。根据用户需求"${userRequirement}"，分析HTML树形结构，找出包含目标数据的层级路径。
+
+请严格按照以下格式输出：
+---分析开始---
+[详细描述你观察到的HTML结构，特别是哪些标签、class、id可能包含目标数据]
+
+---层级判断---
+{"层级路径": "如 div.product-list > ul > li", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false}` },
+    { role: 'user', content: `用户需求：${userRequirement}\n\nHTML结构（前${segment.length}字符）：\n${segment}` }
+  ];
+  
+  try {
+    const result = await callLLM(messages);
+    const layerPath = result.match(/"层级路径":\s*"([^"]+)"/)?.[1] || '';
+    return layerPath;
+  } catch (e) {
+    sendProgress(`⚠️ 检测层级路径失败: ${e.message}`);
+    return '';
+  }
+}
+
+// 使用指定层级路径提取数据
+async function extractNewDataWithPath(treeText, startOffset, userRequirement, layerPath, formatLabel, sendProgress) {
+  const segment = treeText.substring(startOffset, startOffset + 20000);
+  if (!segment) return '';
+  
+  let messages = [
+    { role: 'system', content: `提取数据，如果这个范围没有新数据返回"无更多数据"。\n\n重要：每个数据单独一行输出！\n\n格式示例：\n${formatLabel}1: xxx\n${formatLabel}2: xxx\n\n只输出数据，不要解释。` },
+    { role: 'user', content: `用户需求：${userRequirement}\n\n目标层级路径：${layerPath}\n\nHTML：\n${segment}\n\n提取这个范围内新出现的数据！` }
+  ];
+  
+  let result = await callLLM(messages);
+  return await deduplicateData(result, '', sendProgress);
 }
