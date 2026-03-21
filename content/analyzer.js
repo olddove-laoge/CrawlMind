@@ -258,7 +258,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         container.appendChild(div);
         container.scrollTop = container.scrollHeight;
         
-        if (request.message.includes('已获取所有数据') || request.message.includes('用户中断') || request.message.includes('已达最大') || request.message.includes('提取完成') || request.message.includes('停止爬取')) {
+        if (request.message.includes('已获取所有数据') || request.message.includes('用户中断') || request.message.includes('停止爬取')) {
           setExtractingState(false);
         }
       }
@@ -563,6 +563,7 @@ function stopExtract() {
   chrome.storage.local.set({ stopExtract: true }, () => {
     addMessage('system', '⏹ 已发送停止信号...');
   });
+  // 注意：按钮状态由 progress 消息统一控制，不要在这里修改
 }
 
 // 显示用户确认对话框
