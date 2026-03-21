@@ -7,6 +7,9 @@ let globalUserRequirement = '';
 let globalExtractedData = new Set(); // 已爬取的数据用于去重
 let globalSkipConfirm = false; // 反思后跳过确认
 let globalSelector = ''; // CSS选择器，用于快速提取数据
+let globalDataIndex = 0; // 全局数据索引，保证编号连续
+let globalLazyAttr = 'src'; // 懒加载属性
+let globalFilterPatterns = []; // 过滤模式（由LLM根据具体网站分析得出）
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('Background收到:', request);
@@ -1272,46 +1275,80 @@ async function extractNewDataWithPath(treeText, startOffset, userRequirement, la
   return await deduplicateData(result, '', sendProgress);
 }
 
-// 生成CSS选择器
+// 生成CSS选择器及相关配置
 async function generateSelector(layerPath, userRequirement, extractedData, htmlSegment, sendProgress) {
-  sendProgress(`🤖 正在分析已提取的数据来生成选择器...`);
+  sendProgress(`🤖 正在分析懒加载模式和图片特征...`);
   
   const messages = [
-    { role: 'system', content: `你是一个CSS选择器生成专家。根据已成功提取到的数据，从HTML片段中找到包含这些数据的元素，生成能精确定位的选择器。
+    { role: 'system', content: `你是一个网页数据提取专家。你需要分析HTML片段，找出包含目标数据的最佳选择器，并分析懒加载模式。
+
+任务：
+1. 找到包含用户需要的数据的元素
+2. 分析该元素的懒加载模式（真实URL在哪个属性中）
+3. 识别需要过滤的非目标数据（如广告图、标签图）
+
+输出格式（必须严格按此JSON格式）：
+{
+  "selector": "CSS选择器",
+  "lazyAttr": "懒加载属性名（如data-src, data-original, srcset等，如果src就是真实用data-src等）",
+  "filterPatterns": ["需要过滤的URL关键词数组，如tps-, badge, icon等"],
+  "reason": "简要说明为什么这样选择"
+}
 
 重要规则：
-1. 必须在HTML片段中找到包含 extractedData 中数据的元素
-2. 找到后，从该元素向上回溯，找到有class或id的祖先元素作为起点
-3. 最终选择器必须能选中包含目标数据的那个元素
-4. 如果要提取图片链接，选择器终点必须是 <img> 标签
-5. 如果要提取文本，选择器终点就是包含文本的元素
-6. class名要完整匹配，多层级用 > 连接
-
-例如：
-HTML片段: <div class="product-list"><ul><li class="item"><img src="img1.jpg" /><h3>标题A</h3></li><li class="item"><img src="img2.jpg" /><h3>标题B</h3></li></ul></div>
-已提取到的数据: img1.jpg, img2.jpg
-用户需求: 爬取图片链接
-分析: img标签在HTML中，需要选择器能选中所有img元素
-输出: div.product-list ul li.item img
-
-HTML片段: <div class="list"><div class="card"><a href="/1"><img src="a.jpg"/></a><span>文本A</span></div></div>
-已提取到的数据: a.jpg, 文本A
-用户需求: 爬取图片链接
-分析: 图片在img标签中，需要选择器能选中所有img元素
-输出: div.list div.card img` },
+1. 选择器必须精确指向目标元素，避免选中广告/标签/图标
+2. 分析HTML中img标签的所有属性，找出真实URL所在
+3. 如果有多张图片，分析它们的共同特征（class包含pic/main/origin的更可能是商品图）
+4. 如果是图片链接：过滤掉包含icon/badge/label/tps-/官方活动等关键词的URL
+5. 如果extractedData不为空，必须在HTML中找到这些数据的对应元素
+6. 输出必须是合法JSON，不要有其他内容` },
     { role: 'user', content: `用户需求：${userRequirement}
 层级路径：${layerPath}
 
 HTML片段（包含实际数据）：
-${htmlSegment.substring(0, 8000)}
+${htmlSegment.substring(0, 10000)}
 
-${extractedData ? `已成功提取到的数据（用于在HTML中定位元素）：\n${extractedData.substring(0, 1000)}\n\n` : ''}
-请根据用户需求从HTML片段中找出包含目标数据的元素，生成CSS选择器。
-只输出选择器本身，不要解释。` }
+${extractedData ? `已成功提取到的数据（用于在HTML中定位正确的元素）：
+${extractedData}
+
+` : ''}
+请分析HTML，找出最佳选择器和懒加载属性。` }
   ];
   
   try {
-    const selector = await callLLM(messages);
+    sendProgress(`🤖 LLM正在分析...`);
+    const rawResult = await callLLM(messages);
+    sendProgress(`✅ 分析完成，正在解析...`);
+    
+    // 尝试解析JSON
+    let selector = '';
+    let lazyAttr = 'src';
+    let filterPatterns = ['tps-', 'badge', 'icon', 'label', '!!600000000', '!!6000000000000'];
+    
+    try {
+      const jsonMatch = rawResult.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const info = JSON.parse(jsonMatch[0]);
+        selector = info.selector || '';
+        lazyAttr = info.lazyAttr || 'src';
+        filterPatterns = info.filterPatterns || filterPatterns;
+        sendProgress(`📋 懒加载属性: ${lazyAttr}, 过滤: ${filterPatterns.join(', ')}`);
+      }
+    } catch (e) {
+      sendProgress(`⚠️ 解析JSON失败，尝试提取选择器...`);
+      // 如果JSON解析失败，尝试直接提取选择器
+      selector = rawResult.match(/[a-zA-Z][\w\s\-:>.,#*\[\]='"~^$|=]+img|\w+[\s>]+img|\.[\w\-]+[\s>]+img|#[\w\-]+[\s>]+img/g)?.[0] || '';
+    }
+    
+    if (!selector) {
+      sendProgress(`⚠️ 无法生成选择器`);
+      return '';
+    }
+    
+    // 返回选择器（懒加载属性和过滤规则存储到全局变量）
+    globalLazyAttr = lazyAttr;
+    globalFilterPatterns = filterPatterns;
+    
     return selector.trim();
   } catch (e) {
     sendProgress(`⚠️ 生成选择器失败: ${e.message}`);
@@ -1327,12 +1364,14 @@ async function extractBySelector(tabId, userRequirement, formatLabel, sendProgre
   
   sendProgress(`🔍 使用选择器快速提取: ${globalSelector}`);
   
-  // 在content script中执行选择器，同时传递需求类型
+  // 在content script中执行选择器，传递懒加载属性和过滤规则
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, {
       action: 'extractBySelector',
       selector: globalSelector,
-      requirement: userRequirement
+      requirement: userRequirement,
+      lazyAttr: globalLazyAttr,
+      filterPatterns: globalFilterPatterns
     }, (response) => {
       if (response && response.data) {
         resolve(response.data);

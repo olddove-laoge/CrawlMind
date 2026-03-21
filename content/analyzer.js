@@ -362,6 +362,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'extractBySelector') {
     const selector = request.selector;
     const requirement = request.requirement || '';
+    const lazyAttr = request.lazyAttr || 'src';
+    const filterPatterns = request.filterPatterns || [];
+    
     try {
       const elements = document.querySelectorAll(selector);
       const data = [];
@@ -380,23 +383,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
           
           if (imgEl.tagName === 'IMG') {
-            // 图片：尝试多种可能的属性
-            const possibleSrc = [
-              imgEl.dataset.src,
-              imgEl.dataset.original,
-              imgEl.dataset.lazySrc,
-              imgEl.dataset.defaultSrc,
-              imgEl.dataset.hoverSrc,
-              imgEl.srcset ? imgEl.srcset.split(' ')[0] : '',
-              imgEl.src
-            ];
+            // 优先使用指定的懒加载属性
+            let src = imgEl.getAttribute(lazyAttr);
             
-            for (const src of possibleSrc) {
-              if (src && !src.startsWith('data:') && !src.startsWith('loading') && src.length > 10) {
-                value = src;
-                break;
+            // 如果指定属性没有值，尝试其他常见属性
+            if (!src || src.startsWith('data:') || src.includes('loading')) {
+              const fallbackAttrs = ['data-src', 'data-original', 'data-lazy-src', 'data-default', 'srcset', 'src'];
+              for (const attr of fallbackAttrs) {
+                const val = imgEl.getAttribute(attr);
+                if (val && !val.startsWith('data:') && !val.includes('loading') && val.length > 10) {
+                  src = val;
+                  break;
+                }
               }
             }
+            
+            // 检查是否需要从 srcset 解析
+            if (src === imgEl.srcset) {
+              src = src.split(' ')[0];
+            }
+            
+            value = src || '';
             
             // 处理相对路径
             if (value) {
@@ -416,8 +423,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           value = el.textContent.trim();
         }
         
+        // 过滤无效数据和需要排除的图片
         if (value && value.length > 0 && value !== '[object Object]') {
-          data.push(value);
+          const shouldFilter = filterPatterns.some(pattern => value.includes(pattern));
+          if (!shouldFilter) {
+            data.push(value);
+          }
         }
       }
       sendResponse({ data: data });
