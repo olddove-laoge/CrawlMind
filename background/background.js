@@ -700,16 +700,27 @@ ${treeText.substring(extractStart, extractStart + firstExtractSize)}
     }
   }
   
-  // 将已确认的数据加入全局去重集合
+  // 将已确认的数据加入全局去重集合，并重新格式化
+  const extractValue = (line) => {
+    const match = line.match(/:\s*(.+)$/);
+    return match ? match[1].trim() : line.trim();
+  };
+  
   const resultLines = result.split('\n').filter(l => l.trim());
-  resultLines.forEach(line => globalExtractedData.add(line.trim().toLowerCase()));
-  sendProgress(`🔄 已将 ${resultLines.length} 条数据加入去重集合`);
+  const resultValues = resultLines.map(extractValue);
+  resultValues.forEach(val => globalExtractedData.add(val.toLowerCase()));
+  sendProgress(`🔄 已将 ${resultValues.length} 条数据加入去重集合`);
+  
+  // 用全局索引重新格式化
+  const startIndex = globalDataIndex + 1;
+  const formattedResult = resultValues.map((val, i) => `${formatLabel}${startIndex + i}: ${val}`).join('\n');
+  globalDataIndex = startIndex + resultValues.length - 1;
   
   // 继续获取更多数据 - 从第一次提取结束的位置开始
   sendProgress('📥 继续获取更多数据...');
   let moreResult = await getMoreResultsByLayer(treeText, userRequirement, layerPath, formatLabel, extractStart + firstExtractSize, tabId, sendProgress);
   
-  return result + '\n\n' + moreResult;
+  return formattedResult + '\n' + moreResult;
 }
 
 // 根据层级继续获取更多数据
@@ -787,9 +798,12 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
         break;
       }
       
-      const formatted = uniqueData.map((item, i) => `${formatLabel}${allData.split('\n').filter(l => l.trim()).length + i + 1}: ${item}`).join('\n');
-      allData += formatted + '\n';
-      sendProgress(`🔍 本次提取 ${uniqueData.length} 条数据，累计 ${allData.split('\n').filter(l => l.trim()).length} 条`);
+      // 使用全局索引保证编号连续
+      const startIndex = globalDataIndex + 1;
+      const formatted = uniqueData.map((item, i) => `${formatLabel}${startIndex + i}: ${item}`).join('\n');
+      globalDataIndex = startIndex + uniqueData.length - 1;
+      allData = allData ? allData + '\n' + formatted : formatted;
+      sendProgress(`🔍 本次提取 ${uniqueData.length} 条数据，累计 ${globalDataIndex} 条`);
       
       // 尝试持续滚动
       if (globalScrollContainers.length > 0) {
@@ -864,8 +878,8 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
       sendProgress(`🔍 使用选择器快速提取...`);
       const selectorData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
       if (selectorData && selectorData.length > 0) {
-        // 格式化数据
-        result = selectorData.map((item, i) => `${formatLabel}${i + 1}: ${item}`).join('\n');
+        // 直接使用纯数据，后续统一格式化
+        result = selectorData.join('\n');
       }
     }
     
@@ -1008,9 +1022,12 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
     // 去重检测
     const uniqueResult = await deduplicateData(result, allData, sendProgress);
     if (uniqueResult && uniqueResult.length > 0) {
-      allData += uniqueResult + '\n';
       const lines = uniqueResult.split('\n').filter(l => l.trim());
-      lines.forEach(line => globalExtractedData.add(line.trim().toLowerCase()));
+      const startIndex = globalDataIndex + 1;
+      const formatted = lines.map((line, i) => `${formatLabel}${startIndex + i}: ${line}`).join('\n');
+      globalDataIndex = startIndex + lines.length - 1;
+      allData = allData ? allData + '\n' + formatted : formatted;
+      sendProgress(`🔍 本次提取 ${lines.length} 条数据，累计 ${globalDataIndex} 条`);
     }
     
     startOffset += maxChars;
@@ -1176,25 +1193,31 @@ async function deduplicateData(newData, existingData, sendProgress) {
   }
   
   const newLines = newData.split('\n').filter(l => l.trim());
-  const existingLines = existingData.split('\n').filter(l => l.trim());
   
-  const existingSet = new Set(existingLines.map(l => l.trim().toLowerCase()));
+  // 提取纯数据值（去掉索引前缀）
+  const extractValue = (line) => {
+    const match = line.match(/:\s*(.+)$/);
+    return match ? match[1].trim() : line.trim();
+  };
+  
+  const newValues = newLines.map(extractValue);
+  const existingSet = new Set(existingData.split('\n').filter(l => l.trim()).map(extractValue).map(v => v.toLowerCase()));
   const globalSet = globalExtractedData;
   
-  const uniqueLines = [];
-  for (const line of newLines) {
-    const trimmed = line.trim().toLowerCase();
-    if (!existingSet.has(trimmed) && !globalSet.has(trimmed)) {
-      uniqueLines.push(line.trim());
-      globalSet.add(trimmed);
+  const uniqueValues = [];
+  for (const value of newValues) {
+    const valueLower = value.toLowerCase();
+    if (!existingSet.has(valueLower) && !globalSet.has(valueLower)) {
+      uniqueValues.push(value);
+      globalSet.add(valueLower);
     }
   }
   
-  if (uniqueLines.length < newLines.length) {
-    sendProgress(`🔄 去重过滤了 ${newLines.length - uniqueLines.length} 个重复数据`);
+  if (uniqueValues.length < newValues.length) {
+    sendProgress(`🔄 去重过滤了 ${newValues.length - uniqueValues.length} 个重复数据`);
   }
   
-  return uniqueLines.join('\n');
+  return uniqueValues.join('\n');
 }
 
 // 找到后，继续获取更多数据 - 每次增加5000直到无新数据

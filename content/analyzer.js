@@ -668,7 +668,8 @@ function addMessage(type, content) {
     border-radius: 8px;
     font-size: 13px;
     line-height: 1.5;
-    word-break: break-word;
+    word-break: break-all;
+    white-space: pre-wrap;
     ${type === 'user' ? 'background: #667eea; color: white; margin-left: 20px;' : 'background: white; margin-right: 20px;'}
   `;
   div.textContent = content;
