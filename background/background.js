@@ -696,8 +696,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
   // 使用已识别的格式标签
   let formatPrompt = `${formatLabel}N: xxx (每个数据单独一行)`;
   
-  // 添加停止按钮
-  chrome.tabs.sendMessage(tabId, { action: 'addStopButton' }).catch(() => {});
+
   
   // 获取初始页面URL
   try {

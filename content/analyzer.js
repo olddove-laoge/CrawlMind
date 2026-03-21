@@ -245,12 +245,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     });
   }
   if (request.action === 'progress') {
-    // 显示进度消息，自动打开浮窗
     console.log('收到进度消息:', request.message);
     if (!isPanelOpen) {
       togglePanel();
     }
-    // 等待浮窗创建完成
     setTimeout(() => {
       const container = document.getElementById('crawlmind-messages');
       if (container) {
@@ -260,18 +258,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         container.appendChild(div);
         container.scrollTop = container.scrollHeight;
         
-        // 如果提取完成或中断，恢复按钮状态
-        if (request.message.includes('已获取所有数据') || request.message.includes('用户中断') || request.message.includes('已达最大') || request.message.includes('提取完成')) {
-          document.getElementById('crawlmind-stop').style.display = 'none';
-          document.getElementById('crawlmind-send').style.display = 'block';
+        if (request.message.includes('已获取所有数据') || request.message.includes('用户中断') || request.message.includes('已达最大') || request.message.includes('提取完成') || request.message.includes('停止爬取')) {
+          setExtractingState(false);
         }
       }
     }, 100);
-  }
-  
-  // 添加停止按钮
-  if (request.action === 'addStopButton') {
-    addStopButton();
   }
   
   // 用户确认请求
@@ -507,7 +498,6 @@ function createChatPanel() {
       <input type="text" id="crawlmind-input" placeholder="请描述要爬取的数据..." 
         style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 20px; outline: none;">
       <button id="crawlmind-send" style="padding: 8px 16px; background: #667eea; color: white; border: none; border-radius: 20px; cursor: pointer;">发送</button>
-      <button id="crawlmind-stop" style="padding: 8px 12px; background: #f44336; color: white; border: none; border-radius: 20px; cursor: pointer; display: none;">停止</button>
     </div>
   `;
   
@@ -517,7 +507,6 @@ function createChatPanel() {
   document.getElementById('crawlmind-close').onclick = togglePanel;
   document.getElementById('crawlmind-send').onclick = sendMessage;
   document.getElementById('crawlmind-save-apikey').onclick = saveApiKey;
-  document.getElementById('crawlmind-stop').onclick = stopExtract;
   document.getElementById('crawlmind-input').onkeypress = (e) => {
     if (e.key === 'Enter') sendMessage();
   };
@@ -628,28 +617,23 @@ function showUserConfirmDialog(data, requirement, sendResponse) {
   };
 }
 
-// 添加停止按钮到消息区域
-function addStopButton() {
-  const container = document.getElementById('crawlmind-messages');
-  if (!container) return;
-  
-  // 移除已有的停止按钮
-  const existing = container.querySelector('.stop-btn-container');
-  if (existing) existing.remove();
-  
-  const div = document.createElement('div');
-  div.className = 'stop-btn-container';
-  div.style.cssText = 'padding: 10px; text-align: center;';
-  div.innerHTML = `<button id="crawlmind-stop-batch" style="padding: 8px 24px; background: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer;">⏹ 停止爬取</button>`;
-  container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
-  
-  document.getElementById('crawlmind-stop-batch').onclick = () => {
-    chrome.storage.local.set({ stopExtract: true });
-    addMessage('system', '⏹ 已停止爬取');
-    // 移除按钮
-    div.remove();
-  };
+let isExtracting = false;
+
+function setExtractingState(extracting) {
+  isExtracting = extracting;
+  const sendBtn = document.getElementById('crawlmind-send');
+  if (sendBtn) {
+    if (extracting) {
+      sendBtn.textContent = '停止中...';
+      sendBtn.style.background = '#f44336';
+      sendBtn.style.cursor = 'pointer';
+      sendBtn.onclick = stopExtract;
+    } else {
+      sendBtn.textContent = '发送';
+      sendBtn.style.background = '#667eea';
+      sendBtn.onclick = sendMessage;
+    }
+  }
 }
 
 function sendMessage() {
@@ -675,9 +659,21 @@ function sendMessage() {
   // 重置停止标志
   chrome.storage.local.set({ stopExtract: false });
   
+  // 切换按钮状态为停止
+  setExtractingState(true);
+  
   // 判断是否需要分析页面
   const keywords = ['爬取', '抓取', '采集', '获取', '提取', '数据', '商品', '评论', '价格', '标题', '内容', '链接', '图片'];
   const needAnalysis = keywords.some(kw => message.includes(kw));
+  
+  const handleResponse = (response) => {
+    setExtractingState(false);
+    if (chrome.runtime.lastError) {
+      addMessage('system', '错误: ' + chrome.runtime.lastError.message);
+      return;
+    }
+    addMessage('system', response.result || '分析完成');
+  };
   
   if (needAnalysis) {
     addMessage('system', '正在分析页面结构...');
@@ -686,28 +682,16 @@ function sendMessage() {
       action: 'chat', 
       message: message,
       treeText: treeText 
-    }, (response) => {
-      if (chrome.runtime.lastError) {
-        addMessage('system', '错误: ' + chrome.runtime.lastError.message);
-        return;
-      }
-      addMessage('system', response.result || '分析完成');
-    });
+    }, handleResponse);
   } else {
     addMessage('system', '正在思考...');
     
     chrome.runtime.sendMessage({ 
-      action: 'chat', 
+      action: 'chat',
       message: message,
       mode: 'casual',
       treeText: treeText 
-    }, (response) => {
-      if (chrome.runtime.lastError) {
-        addMessage('system', '错误: ' + chrome.runtime.lastError.message);
-        return;
-      }
-      addMessage('system', response.result || '分析完成');
-    });
+    }, handleResponse);
   }
 }
 
