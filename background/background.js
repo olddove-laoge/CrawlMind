@@ -218,6 +218,17 @@ async function detectScrollAndPagination(tabId, sendProgress) {
 // 分析策略：分层提取
 async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgress) {
   try {
+    // 重置全局状态，避免污染
+    globalScrollContainers = [];
+    globalPaginationButtons = [];
+    globalUserRequirement = '';
+    globalExtractedData = new Set();
+    globalSkipConfirm = false;
+    globalSelector = '';
+    globalDataIndex = 0;
+    globalLazyAttr = 'src';
+    globalFilterPatterns = [];
+    
     // 同时发送到content script显示进度
     const sendProgressToPage = (msg) => {
       console.log('发送进度:', msg);
