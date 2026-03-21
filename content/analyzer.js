@@ -212,6 +212,89 @@ function scrollContainer(el) {
   return true;
 }
 
+// 持续滚动（模拟人类滚动）
+async function smoothScrollContainer(el, stopSignal) {
+  const scrollStep = 300;
+  const scrollInterval = 50;
+  const maxScrollTime = 60000; // 最多滚动60秒
+  
+  const startTime = Date.now();
+  let lastScrollTop = el.scrollTop;
+  let stableCount = 0;
+  const stableThreshold = 5; // 连续5次滚动位置不变认为到底了
+  
+  return new Promise((resolve) => {
+    const scroll = () => {
+      // 检查停止信号
+      if (stopSignal && stopSignal.current) {
+        resolve({ success: true, reason: 'stopped' });
+        return;
+      }
+      
+      // 检查超时
+      if (Date.now() - startTime > maxScrollTime) {
+        resolve({ success: true, reason: 'timeout' });
+        return;
+      }
+      
+      const beforeScroll = el.scrollTop;
+      el.scrollTop += scrollStep;
+      
+      // 触发滚动事件，让懒加载生效
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+      
+      // 检查是否还能继续滚动
+      if (el.scrollTop === beforeScroll || el.scrollTop >= el.scrollHeight - el.clientHeight) {
+        stableCount++;
+        if (stableCount >= stableThreshold) {
+          resolve({ success: true, reason: 'bottom' });
+          return;
+        }
+      } else {
+        stableCount = 0;
+      }
+      
+      lastScrollTop = el.scrollTop;
+      
+      // 随机延迟，模拟人类滚动
+      const delay = scrollInterval + Math.random() * 30;
+      setTimeout(scroll, delay);
+    };
+    
+    scroll();
+  });
+}
+
+// 检查容器是否已完全加载
+function checkContainerLoaded(el, checkCount = 3) {
+  return new Promise((resolve) => {
+    let count = 0;
+    let lastImgCount = 0;
+    
+    const check = () => {
+      const imgs = el.querySelectorAll('img');
+      const loadedImgs = Array.from(imgs).filter(img => {
+        return img.complete && img.naturalWidth > 0;
+      });
+      
+      if (loadedImgs.length === lastImgCount) {
+        count++;
+      } else {
+        count = 0;
+        lastImgCount = loadedImgs.length;
+      }
+      
+      if (count >= checkCount) {
+        resolve({ loaded: true, imgCount: loadedImgs.length });
+      } else {
+        setTimeout(check, 500);
+      }
+    };
+    
+    check();
+  });
+}
+
 // 尝试点击翻页按钮
 function clickPagination(el) {
   el.click();
@@ -293,6 +376,41 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } else {
       sendResponse({ success: false, error: '容器不存在' });
     }
+    return true;
+  }
+  
+  // 持续滚动（模拟人类）
+  if (request.action === 'smoothScroll') {
+    const { index, stopKey } = request;
+    const containers = findScrollableContainers();
+    
+    if (!containers[index]) {
+      sendResponse({ success: false, error: '容器不存在' });
+      return true;
+    }
+    
+    const container = containers[index].element;
+    const stopSignal = { current: false };
+    
+    // 存储停止信号，供 background 访问
+    window.__crawlmind_stopScroll = stopSignal;
+    
+    // 监听停止信号
+    const checkStop = setInterval(() => {
+      chrome.storage.local.get(stopKey, (result) => {
+        if (result[stopKey]) {
+          stopSignal.current = true;
+          clearInterval(checkStop);
+        }
+      });
+    }, 100);
+    
+    smoothScrollContainer(container, stopSignal).then((result) => {
+      clearInterval(checkStop);
+      delete window.__crawlmind_stopScroll;
+      sendResponse({ success: true, ...result });
+    });
+    
     return true;
   }
   

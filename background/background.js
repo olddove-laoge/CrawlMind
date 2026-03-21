@@ -40,7 +40,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   
   // 滚动容器和翻页检测 - 转发到content script
-  if (['findScrollable', 'findPagination', 'doScroll', 'doClickPagination'].includes(request.action)) {
+  if (['findScrollable', 'findPagination', 'doScroll', 'smoothScroll', 'doClickPagination'].includes(request.action)) {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tabId = tabs[0].id;
       chrome.tabs.sendMessage(tabId, request, (response) => {
@@ -133,6 +133,29 @@ async function callLLM(messages) {
     throw new Error('API响应格式错误');
   }
   return data.choices[0].message.content;
+}
+
+// 持续滚动容器（模拟人类）
+async function smoothScrollContainer(tabId, containerIndex, sendProgress) {
+  const stopKey = 'smoothScrollStop';
+  await chrome.storage.local.set({ [stopKey]: false });
+  
+  sendProgress(`📜 开始持续滚动...`);
+  
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, {
+      action: 'smoothScroll',
+      index: containerIndex,
+      stopKey: stopKey
+    }, (response) => {
+      if (response?.success) {
+        sendProgress(`📜 滚动完成: ${response.reason}`);
+      } else {
+        sendProgress(`⚠️ 滚动失败: ${response?.error}`);
+      }
+      resolve(response);
+    });
+  });
 }
 
 // 检测滚动容器和翻页按钮
@@ -768,16 +791,13 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
       allData += formatted + '\n';
       sendProgress(`🔍 本次提取 ${uniqueData.length} 条数据，累计 ${allData.split('\n').filter(l => l.trim()).length} 条`);
       
-      // 尝试滚动
+      // 尝试持续滚动
       if (globalScrollContainers.length > 0) {
-        sendProgress(`📜 尝试滚动加载更多...`);
-        for (let i = 0; i < globalScrollContainers.length; i++) {
-          const scrollResult = await chrome.tabs.sendMessage(tabId, { action: 'doScroll', index: i });
-          if (scrollResult?.success) {
-            sendProgress(`📜 已滚动，等待加载...`);
-            await new Promise(r => setTimeout(r, 1500));
-            break;
-          }
+        sendProgress(`📜 持续滚动加载更多...`);
+        const scrollResult = await smoothScrollContainer(tabId, 0, sendProgress);
+        if (scrollResult?.success) {
+          sendProgress(`📜 滚动完成，等待加载...`);
+          await new Promise(r => setTimeout(r, 1000));
         }
       } else {
         break;
@@ -872,37 +892,33 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
       
       let foundNewData = false;
       
-      // 1. 尝试滚动滚动容器
+      // 1. 尝试持续滚动滚动容器
       if (globalScrollContainers.length > 0) {
-        sendProgress(`📜 尝试滚动 ${globalScrollContainers.length} 个滚动容器...`);
-        
-        for (let i = 0; i < globalScrollContainers.length; i++) {
-          const scrollResult = await chrome.tabs.sendMessage(tabId, { action: 'doScroll', index: i });
-          if (scrollResult?.success) {
-            sendProgress(`📜 已滚动容器 ${i + 1}，等待加载...`);
-            await new Promise(r => setTimeout(r, 1500));
-            
-            // 优先使用选择器提取
-            let newData = null;
-            if (globalSelector) {
-              newData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
+        sendProgress(`📜 持续滚动加载更多...`);
+        const scrollResult = await smoothScrollContainer(tabId, 0, sendProgress);
+        if (scrollResult?.success) {
+          sendProgress(`📜 滚动完成，等待加载...`);
+          await new Promise(r => setTimeout(r, 1000));
+          
+          // 优先使用选择器提取
+          let newData = null;
+          if (globalSelector) {
+            newData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
+          }
+          
+          // 如果选择器没提取到，用LLM
+          if (!newData || newData.length === 0) {
+            const newFullTree = await getFullPageTree(tabId);
+            if (newFullTree && newFullTree.length > treeText.length) {
+              newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
             }
-            
-            // 如果选择器没提取到，用LLM
-            if (!newData || newData.length === 0) {
-              const newFullTree = await getFullPageTree(tabId);
-              if (newFullTree && newFullTree.length > treeText.length) {
-                newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
-              }
-            }
-            
-            if (newData && newData.length > 0) {
-              sendProgress(`📜 滚动后发现 ${newData.length} 个新数据`);
-              allData += newData + '\n';
-              treeText = await getFullPageTree(tabId);
-              foundNewData = true;
-              break;
-            }
+          }
+          
+          if (newData && newData.length > 0) {
+            sendProgress(`📜 滚动后发现 ${newData.length} 个新数据`);
+            allData += newData + '\n';
+            treeText = await getFullPageTree(tabId);
+            foundNewData = true;
           }
         }
       }
@@ -1011,27 +1027,23 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
   
   let foundNewData = false;
   
-  // 1. 尝试滚动滚动容器
+  // 1. 尝试持续滚动滚动容器
   if (globalScrollContainers.length > 0) {
-    sendProgress(`📜 尝试滚动 ${globalScrollContainers.length} 个滚动容器...`);
-    
-    for (let i = 0; i < globalScrollContainers.length; i++) {
-      const scrollResult = await chrome.tabs.sendMessage(tabId, { action: 'doScroll', index: i });
-      if (scrollResult?.success) {
-        sendProgress(`📜 已滚动容器 ${i + 1}，等待加载...`);
-        await new Promise(r => setTimeout(r, 2000));
-        
-        const newFullTree = await getFullPageTree(tabId);
-        if (newFullTree && newFullTree.length > treeText.length) {
-          const newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
-          if (newData && newData.length > 0) {
-            sendProgress(`📜 滚动后发现新数据，继续提取...`);
-            allData += newData + '\n';
-            treeText = newFullTree;
-            startOffset = treeText.length;
-            foundNewData = true;
-            break;
-          }
+    sendProgress(`📜 持续滚动加载更多...`);
+    const scrollResult = await smoothScrollContainer(tabId, 0, sendProgress);
+    if (scrollResult?.success) {
+      sendProgress(`📜 滚动完成，等待加载...`);
+      await new Promise(r => setTimeout(r, 2000));
+      
+      const newFullTree = await getFullPageTree(tabId);
+      if (newFullTree && newFullTree.length > treeText.length) {
+        const newData = await extractNewData(newFullTree, treeText.length, userRequirement, layerPath, formatLabel, sendProgress);
+        if (newData && newData.length > 0) {
+          sendProgress(`📜 滚动后发现新数据，继续提取...`);
+          allData += newData + '\n';
+          treeText = newFullTree;
+          startOffset = treeText.length;
+          foundNewData = true;
         }
       }
     }
