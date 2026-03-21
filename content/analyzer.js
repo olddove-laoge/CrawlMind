@@ -370,13 +370,63 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // 使用选择器快速提取数据
   if (request.action === 'extractBySelector') {
     const selector = request.selector;
+    const requirement = request.requirement || '';
     try {
       const elements = document.querySelectorAll(selector);
       const data = [];
+      
+      // 根据需求判断要提取什么
+      const isImage = requirement.includes('图片') || requirement.includes('img') || requirement.includes('photo');
+      const isLink = requirement.includes('链接') || requirement.includes('href');
+      
       for (const el of elements) {
-        const text = el.textContent.trim();
-        if (text) {
-          data.push(text);
+        let value = '';
+        
+        if (isImage) {
+          let imgEl = el;
+          if (el.tagName === 'A' || el.tagName === 'DIV') {
+            imgEl = el.querySelector('img') || el;
+          }
+          
+          if (imgEl.tagName === 'IMG') {
+            // 图片：尝试多种可能的属性
+            const possibleSrc = [
+              imgEl.dataset.src,
+              imgEl.dataset.original,
+              imgEl.dataset.lazySrc,
+              imgEl.dataset.defaultSrc,
+              imgEl.dataset.hoverSrc,
+              imgEl.srcset ? imgEl.srcset.split(' ')[0] : '',
+              imgEl.src
+            ];
+            
+            for (const src of possibleSrc) {
+              if (src && !src.startsWith('data:') && !src.startsWith('loading') && src.length > 10) {
+                value = src;
+                break;
+              }
+            }
+            
+            // 处理相对路径
+            if (value) {
+              if (value.startsWith('//')) {
+                value = window.location.protocol + value;
+              } else if (value.startsWith('/')) {
+                value = window.location.origin + value;
+              }
+            }
+          }
+        } else if (isLink && el.tagName === 'A') {
+          value = el.href || '';
+        }
+        
+        // 如果没有提取到特殊属性，提取文本
+        if (!value) {
+          value = el.textContent.trim();
+        }
+        
+        if (value && value.length > 0 && value !== '[object Object]') {
+          data.push(value);
         }
       }
       sendResponse({ data: data });

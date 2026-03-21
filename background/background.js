@@ -292,7 +292,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
     
     sendProgressToPage('🔄 开始循环验证查找...');
     
-    // 快速跳过非商品区域
+    // 快速跳过明显无关的区域
     const skipKeywords = [];
     
     // 从上一次分析的层级位置继续
@@ -302,7 +302,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
       let segment = fullContent.substring(offset, offset + 20000);
       if (!segment) break;
       
-      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}，当前偏移${offset}）：\n${segment}\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察是否包含具体的商品列表/商品名称。注意：如果只是导航菜单、分类链接、筛选条件等，不是真正的商品列表]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "如 div.class", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
+      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}，当前偏移${offset}）：\n${segment}\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察是否包含用户需要的数据（可能是文本、链接、图片、价格、评论、标题、音频、视频、文件等任何内容）]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "如 div.class", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
       
       sendProgressToPage(`🤖 LLM正在分析深度${currentDepth + 1}...`);
       sendProgressToPage(`💭 思考中: 检查深度${currentDepth + 1}是否包含目标数据...`);
@@ -325,12 +325,12 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
         sendProgressToPage(`🏷️ 该层级属性: ${layerAttrs}`);
       }
       
-      // ====== 智能跳过非商品区域 ======
+      // ====== 智能跳过明显无关区域 ======
       let shouldSkip = false;
       for (let kw of skipKeywords) {
         if (layerPath.toLowerCase().includes(kw.toLowerCase()) || 
             loopAnalysisPart.toLowerCase().includes(kw.toLowerCase())) {
-          sendProgressToPage(`⏭ 跳过非商品区域 (${kw}): ${layerPath}`);
+          sendProgressToPage(`⏭ 跳过无关区域 (${kw}): ${layerPath}`);
           shouldSkip = true;
           break;
         }
@@ -353,22 +353,23 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
         
         // 让LLM重新思考
         let reflectionMessages = [
-          { role: 'system', content: `你是反思专家。之前选择的层级路径都没有找到真正的商品列表，你需要重新分析。
+          { role: 'system', content: `你是网页数据定位专家。用户想要的数据是："${userRequirement}"
 
 已尝试过的路径：${Array.from(triedLayers).join(', ')}
 
-用户需求：${userRequirement}
-
 你需要：
 1. 重新分析HTML结构
-2. 找出可能包含真正商品列表的位置（注意：商品列表通常在页面中后部，可能需要滚动加载）
-3. 给出新的、更可能包含商品的层级路径
+2. 找出可能包含目标数据的正确位置
+3. 给出新的、更可能包含目标数据的层级路径
 
-重要：商品列表通常不在导航、筛选、分类区域，而是在主内容区域！` },
-          { role: 'user', content: `当前HTML片段（偏移${offset}）：
+提示：目标数据可能是文本、链接、图片、价格、评论、标题、音频、视频、文件等任何内容，不限于特定类型。` },
+          { role: 'user', content: `用户需求：${userRequirement}
+已尝试过的路径：${Array.from(triedLayers).join(', ')}
+
+当前HTML片段（偏移${offset}）：
 ${segment}
 
-请重新分析并给出一个新的、更可能包含商品列表的层级路径。格式：
+请重新分析并给出一个新的、更可能包含目标数据的层级路径。格式：
 {"新的层级路径": "xxx", "理由": "为什么这个路径可能不同", "建议偏移量": 数字}` }
         ];
         
@@ -418,7 +419,7 @@ ${segment}
           { role: 'system', content: `你是分析专家。用户拒绝了你提取的数据，你需要分析可能的原因。
 
 分析维度：
-1. 数据类型不对？例如：要的是商品名称，却提取了分类名称
+1. 数据类型不对？例如：要的是标题，却提取了描述
 2. 数据不完整？例如：只提取了部分
 3. 位置不对？例如：在错误的区域提取
 4. 格式不对？例如：格式不符合用户预期
@@ -440,17 +441,15 @@ ${segment}
         totalFailures++;
         
         let reflectionMessages = [
-          { role: 'system', content: `你是反思专家。用户明确拒绝了你提取的数据。
-
-用户需求：${userRequirement}
+          { role: 'system', content: `你是网页数据定位专家。用户想要的数据是："${userRequirement}"
 之前的层级路径：${layerPath}
-拒绝原因分析：${rejectReason}
+用户拒绝原因：${rejectReason}
 
 已尝试过的路径：${Array.from(triedLayers).join(', ')}
 
 你需要：
 1. 根据拒绝原因，重新分析HTML结构
-2. 找出真正包含用户所需数据的正确位置
+2. 找出真正包含目标数据的正确位置
 3. 给出新的层级路径和偏移量` },
           { role: 'user', content: `请根据拒绝原因 "${rejectReason}" 重新分析。
 
@@ -554,11 +553,13 @@ async function extractByLayer(treeText, userRequirement, layerPath, tabId, sendP
     { role: 'system', content: `你是格式分析专家。根据用户的提取需求，判断最合适的输出格式标签。
 
 用户需求示例和对应格式：
-- "商品名称" → "商品"
+- "小说标题" → "标题"
 - "评论内容" → "评论"  
-- "商品价格" → "商品"
+- "商品价格" → "价格"
 - "图片链接" → "图片"
 - "文章文本" → "段落"
+- "视频地址" → "视频"
+- "下载链接" → "链接"
 
 只输出一个最合适的标签，不要其他内容。` },
     { role: 'user', content: `用户需求：${userRequirement}\n\n请判断输出格式标签是什么？` }
@@ -663,12 +664,11 @@ ${treeText.substring(extractStart, extractStart + firstExtractSize)}
   
   sendProgress('✅ 用户确认数据正确，继续获取更多数据...');
   
-  // 如果还没有选择器，让LLM生成
+  // 如果还没有选择器，让LLM基于已提取的数据生成
   if (!globalSelector && layerPath) {
     sendProgress('🤖 正在生成CSS选择器...');
-    // 获取包含数据的HTML片段
     const htmlSegment = treeText.substring(extractStart, extractStart + firstExtractSize);
-    globalSelector = await generateSelector(layerPath, userRequirement, htmlSegment, sendProgress);
+    globalSelector = await generateSelector(layerPath, userRequirement, result, htmlSegment, sendProgress);
     if (globalSelector) {
       sendProgress(`✅ CSS选择器已生成: ${globalSelector}`);
     }
@@ -710,6 +710,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
     sendProgress(`🔍 使用选择器一次性提取所有数据...`);
     
     // 循环提取直到没有新数据
+    let selectorFailCount = 0;
     while (true) {
       const { stopExtract } = await chrome.storage.local.get('stopExtract');
       if (stopExtract) {
@@ -721,8 +722,29 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
       const selectorData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgress);
       
       if (!selectorData || selectorData.length === 0) {
-        sendProgress('⚠️ 选择器未提取到数据');
-        break;
+        selectorFailCount++;
+        sendProgress(`⚠️ 选择器未提取到数据 (第${selectorFailCount}次)`);
+        
+        // 如果连续失败3次，尝试重新生成选择器
+        if (selectorFailCount >= 3) {
+          sendProgress('🔄 选择器多次失败，尝试重新生成...');
+          const newTree = await getFullPageTree(tabId);
+          if (newTree) {
+            const newSelector = await generateSelector(layerPath, userRequirement, '', newTree, sendProgress);
+            if (newSelector && newSelector !== globalSelector) {
+              globalSelector = newSelector;
+              sendProgress(`✅ 新选择器: ${globalSelector}`);
+              selectorFailCount = 0;
+              continue;
+            }
+          }
+          sendProgress('⚠️ 重新生成选择器失败，回退到LLM提取');
+          break;
+        }
+        
+        // 等待一下再试
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
       }
       
       // 去重后格式化
@@ -770,7 +792,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
         
         if (clickResult?.success) {
           sendProgress(`🔄 已点击翻页按钮，等待加载...`);
-          await new Promise(r => setTimeout(r, 2000));
+          await new Promise(r => setTimeout(r, 3000));
           
           let isNewPage = false;
           try {
@@ -1252,29 +1274,41 @@ async function extractNewDataWithPath(treeText, startOffset, userRequirement, la
 }
 
 // 生成CSS选择器
-async function generateSelector(layerPath, userRequirement, htmlSegment, sendProgress) {
+async function generateSelector(layerPath, userRequirement, extractedData, htmlSegment, sendProgress) {
+  sendProgress(`🤖 正在分析已提取的数据来生成选择器...`);
+  
   const messages = [
-    { role: 'system', content: `你是一个CSS选择器生成专家。根据用户需求和实际HTML代码，生成可以直接在document.querySelectorAll中使用的CSS选择器。
+    { role: 'system', content: `你是一个CSS选择器生成专家。根据已成功提取到的数据，从HTML片段中找到包含这些数据的元素，生成能精确定位的选择器。
 
-要求：
-1. 只输出CSS选择器，不要其他内容
-2. 选择器要能选中包含目标数据的元素
-3. 如果HTML中元素有class，用.class形式；如果有id，用#id形式
-4. 优先使用class选择器，class名要完整匹配
-5. 多层级用 > 连接
-6. 选择器要尽量精确，避免选中不需要的元素
+重要规则：
+1. 必须在HTML片段中找到包含 extractedData 中数据的元素
+2. 找到后，从该元素向上回溯，找到有class或id的祖先元素作为起点
+3. 最终选择器必须能选中包含目标数据的那个元素
+4. 如果要提取图片链接，选择器终点必须是 <img> 标签
+5. 如果要提取文本，选择器终点就是包含文本的元素
+6. class名要完整匹配，多层级用 > 连接
 
 例如：
-HTML片段: <div class="product-list"><ul><li class="item">商品名称</li></ul></div>
-用户需求: 爬取商品名称
-输出: div.product-list ul li.item` },
+HTML片段: <div class="product-list"><ul><li class="item"><img src="img1.jpg" /><h3>标题A</h3></li><li class="item"><img src="img2.jpg" /><h3>标题B</h3></li></ul></div>
+已提取到的数据: img1.jpg, img2.jpg
+用户需求: 爬取图片链接
+分析: img标签在HTML中，需要选择器能选中所有img元素
+输出: div.product-list ul li.item img
+
+HTML片段: <div class="list"><div class="card"><a href="/1"><img src="a.jpg"/></a><span>文本A</span></div></div>
+已提取到的数据: a.jpg, 文本A
+用户需求: 爬取图片链接
+分析: 图片在img标签中，需要选择器能选中所有img元素
+输出: div.list div.card img` },
     { role: 'user', content: `用户需求：${userRequirement}
 层级路径：${layerPath}
 
 HTML片段（包含实际数据）：
-${htmlSegment.substring(0, 5000)}
+${htmlSegment.substring(0, 8000)}
 
-请根据以上HTML片段生成CSS选择器，只输出选择器本身，不要其他内容。` }
+${extractedData ? `已成功提取到的数据（用于在HTML中定位元素）：\n${extractedData.substring(0, 1000)}\n\n` : ''}
+请根据用户需求从HTML片段中找出包含目标数据的元素，生成CSS选择器。
+只输出选择器本身，不要解释。` }
   ];
   
   try {
@@ -1294,11 +1328,12 @@ async function extractBySelector(tabId, userRequirement, formatLabel, sendProgre
   
   sendProgress(`🔍 使用选择器快速提取: ${globalSelector}`);
   
-  // 在content script中执行选择器
+  // 在content script中执行选择器，同时传递需求类型
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, {
       action: 'extractBySelector',
-      selector: globalSelector
+      selector: globalSelector,
+      requirement: userRequirement
     }, (response) => {
       if (response && response.data) {
         resolve(response.data);
