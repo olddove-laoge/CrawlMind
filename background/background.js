@@ -768,7 +768,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
         }
         
         // 等待一下再试
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 3000));
         continue;
       }
       
@@ -796,8 +796,8 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
         sendProgress(`📜 持续滚动加载更多...`);
         const scrollResult = await smoothScrollContainer(tabId, 0, sendProgress);
         if (scrollResult?.success) {
-          sendProgress(`📜 滚动完成，等待加载...`);
-          await new Promise(r => setTimeout(r, 1000));
+          sendProgress(`📜 滚动完成，等待图片加载...`);
+          await new Promise(r => setTimeout(r, 3000));
         }
       } else {
         break;
@@ -897,8 +897,8 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
         sendProgress(`📜 持续滚动加载更多...`);
         const scrollResult = await smoothScrollContainer(tabId, 0, sendProgress);
         if (scrollResult?.success) {
-          sendProgress(`📜 滚动完成，等待加载...`);
-          await new Promise(r => setTimeout(r, 1000));
+          sendProgress(`📜 滚动完成，等待图片加载...`);
+          await new Promise(r => setTimeout(r, 3000));
           
           // 优先使用选择器提取
           let newData = null;
@@ -933,7 +933,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
           
           if (clickResult?.success) {
             sendProgress(`🔄 已点击翻页按钮 ${i + 1}，等待加载...`);
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, 3000));
             
             // 检测是否真的到了新页面
             let isNewPage = false;
@@ -1032,8 +1032,8 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
     sendProgress(`📜 持续滚动加载更多...`);
     const scrollResult = await smoothScrollContainer(tabId, 0, sendProgress);
     if (scrollResult?.success) {
-      sendProgress(`📜 滚动完成，等待加载...`);
-      await new Promise(r => setTimeout(r, 2000));
+      sendProgress(`📜 滚动完成，等待图片加载...`);
+      await new Promise(r => setTimeout(r, 3000));
       
       const newFullTree = await getFullPageTree(tabId);
       if (newFullTree && newFullTree.length > treeText.length) {
@@ -1059,7 +1059,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
       
       if (clickResult?.success) {
         sendProgress(`🔄 已点击翻页按钮 ${i + 1}，等待加载...`);
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 3000));
         
         let isNewPage = false;
         try {
