@@ -476,6 +476,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   
+  // 根据文本查找元素路径
+  if (request.action === 'findElementPath') {
+    const result = findElementByText(request.text, request.maxLength || 50);
+    sendResponse(result);
+  }
+  
+  // 根据多个文本查找元素路径
+  if (request.action === 'findMultipleElementPaths') {
+    const results = findMultipleElementsByTexts(request.texts || []);
+    sendResponse({ elements: results });
+  }
+  
+  // 验证选择器
+  if (request.action === 'validateSelector') {
+    const result = validateSelectorOnPage(request.selector);
+    sendResponse(result);
+  }
+  
+  // 使用选择器查找元素
+  if (request.action === 'findElements') {
+    const elements = findElementsBySelector(request.selector);
+    sendResponse({ elements: elements });
+  }
+  
   // 使用选择器快速提取数据
   if (request.action === 'extractBySelector') {
     const selector = request.selector;
@@ -558,6 +582,165 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   
   return true;
 });
+
+// ==================== 精确选择器生成 ====================
+
+function findElementByText(text, maxLength = 50) {
+  if (!text || text.length < 2) return null;
+  
+  const truncatedText = text.substring(0, maxLength);
+  const allElements = document.querySelectorAll('*');
+  
+  for (const el of allElements) {
+    const elText = el.textContent.trim().replace(/\s+/g, ' ');
+    if (elText.includes(truncatedText) || truncatedText.includes(elText.substring(0, 30))) {
+      const path = getElementPath(el);
+      const uniqueAttrs = getUniqueAttrs(el);
+      const tag = el.tagName.toLowerCase();
+      
+      return {
+        path: path,
+        tag: tag,
+        id: el.id || '',
+        className: typeof el.className === 'string' ? el.className : '',
+        attributes: uniqueAttrs,
+        text: elText.substring(0, 100),
+        rect: el.getBoundingClientRect()
+      };
+    }
+  }
+  return null;
+}
+
+function getElementPath(element) {
+  if (!element || element === document.body || element === document.documentElement) {
+    return 'body';
+  }
+  
+  if (element.id) {
+    return `#${element.id}`;
+  }
+  
+  const path = [];
+  let current = element;
+  
+  while (current && current !== document.body && current !== document.documentElement) {
+    let selector = current.tagName.toLowerCase();
+    
+    if (current.id) {
+      path.unshift(`#${current.id}`);
+      break;
+    }
+    
+    if (current.className && typeof current.className === 'string') {
+      const classes = current.className.trim().split(/\s+/).filter(c => c && c.length < 30);
+      if (classes.length > 0) {
+        const shortClasses = classes.slice(0, 2);
+        selector += '.' + shortClasses.join('.');
+      }
+    }
+    
+    const parent = current.parentElement;
+    if (parent && parent.children.length > 1) {
+      const siblings = Array.from(parent.children).filter(c => c.tagName === current.tagName);
+      if (siblings.length > 1) {
+        const index = siblings.indexOf(current) + 1;
+        selector += `:nth-of-type(${index})`;
+      }
+    }
+    
+    path.unshift(selector);
+    current = current.parentElement;
+  }
+  
+  return path.join(' > ') || 'body';
+}
+
+function getUniqueAttrs(element) {
+  const attrs = {};
+  const important = ['class', 'id', 'data-id', 'data-v-', 'role', 'itemtype', 'itemprop', 'aria-label', 'data-testid'];
+  
+  for (const attr of element.attributes) {
+    const name = attr.name;
+    if (important.some(k => name === k || name.startsWith(k))) {
+      attrs[name] = attr.value;
+    }
+  }
+  
+  return attrs;
+}
+
+function findMultipleElementsByTexts(texts) {
+  const results = [];
+  
+  for (const text of texts) {
+    if (!text || text.length < 2) continue;
+    
+    const truncatedText = text.substring(0, 40);
+    const allElements = document.querySelectorAll('*');
+    
+    let found = false;
+    for (const el of allElements) {
+      if (found) break;
+      
+      const elText = el.textContent.trim().replace(/\s+/g, ' ');
+      if (elText.includes(truncatedText) || (truncatedText.length > 10 && elText.substring(0, 20) === truncatedText.substring(0, 20))) {
+        results.push({
+          text: text.substring(0, 50),
+          path: getElementPath(el),
+          tag: el.tagName.toLowerCase(),
+          id: el.id || '',
+          className: typeof el.className === 'string' ? el.className.split(/\s+/).slice(0, 3).join(' ') : '',
+          attributes: getUniqueAttrs(el),
+          matchedText: elText.substring(0, 50)
+        });
+        found = true;
+      }
+    }
+  }
+  
+  return results;
+}
+
+function findElementsBySelector(selector) {
+  try {
+    const elements = document.querySelectorAll(selector);
+    return Array.from(elements).map((el, i) => ({
+      index: i,
+      tag: el.tagName.toLowerCase(),
+      id: el.id || '',
+      className: typeof el.className === 'string' ? el.className.split(/\s+/).slice(0, 3).join(' ') : '',
+      text: el.textContent.trim().substring(0, 100),
+      attributes: getUniqueAttrs(el),
+      rect: el.getBoundingClientRect()
+    }));
+  } catch (e) {
+    return [];
+  }
+}
+
+function validateSelectorOnPage(selector) {
+  try {
+    const elements = document.querySelectorAll(selector);
+    if (elements.length === 0) {
+      return { valid: false, count: 0 };
+    }
+    
+    const samples = Array.from(elements).slice(0, 3).map(el => ({
+      tag: el.tagName.toLowerCase(),
+      text: el.textContent.trim().substring(0, 50),
+      hasText: el.textContent.trim().length > 0
+    }));
+    
+    return {
+      valid: true,
+      count: elements.length,
+      samples: samples
+    };
+  } catch (e) {
+    return { valid: false, count: 0, error: e.message };
+  }
+}
 
 // 创建浮窗UI
 function createFloatingButton() {

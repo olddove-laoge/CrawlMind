@@ -705,7 +705,7 @@ ${treeText.substring(extractStart, extractStart + firstExtractSize)}
   if (!globalSelector && layerPath) {
     sendProgress('🤖 正在生成CSS选择器...');
     const htmlSegment = treeText.substring(extractStart, extractStart + firstExtractSize);
-    globalSelector = await generateSelector(layerPath, userRequirement, result, htmlSegment, sendProgress);
+    globalSelector = await generateSelector(layerPath, userRequirement, result, htmlSegment, sendProgress, tabId);
     if (globalSelector) {
       sendProgress(`✅ CSS选择器已生成: ${globalSelector}`);
     }
@@ -777,7 +777,7 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
           sendProgress('🔄 选择器多次失败，尝试重新生成...');
           const newTree = await getFullPageTree(tabId);
           if (newTree) {
-            const newSelector = await generateSelector(layerPath, userRequirement, '', newTree, sendProgress);
+            const newSelector = await generateSelector(layerPath, userRequirement, '', newTree, sendProgress, tabId);
             if (newSelector && newSelector !== globalSelector) {
               globalSelector = newSelector;
               sendProgress(`✅ 新选择器: ${globalSelector}`);
@@ -1321,85 +1321,412 @@ async function extractNewDataWithPath(treeText, startOffset, userRequirement, la
   return await deduplicateData(result, '', sendProgress);
 }
 
-// 生成CSS选择器及相关配置
-async function generateSelector(layerPath, userRequirement, extractedData, htmlSegment, sendProgress) {
-  sendProgress(`🤖 正在分析懒加载模式和图片特征...`);
+// 生成CSS选择器及相关配置 - 新方案：基于DOM路径
+async function generateSelector(layerPath, userRequirement, extractedData, htmlSegment, sendProgress, tabId) {
+  sendProgress(`🔍 开始精确选择器生成...`);
+  
+  // 第一步：解析已提取的数据
+  const dataLines = extractedData.split('\n').filter(l => l.trim());
+  const dataValues = dataLines.map(line => {
+    const match = line.match(/:\s*(.+)$/);
+    return match ? match[1].trim() : line.trim();
+  }).filter(v => v.length > 0);
+  
+  sendProgress(`📊 解析到 ${dataValues.length} 条数据`);
+  
+  if (dataValues.length === 0) {
+    sendProgress(`⚠️ 无有效数据，回退到LLM分析`);
+    return await generateSelectorByLLM(layerPath, userRequirement, extractedData, htmlSegment, sendProgress);
+  }
+  
+  // 第二步：在DOM中查找这些数据对应的元素路径
+  sendProgress(`🔎 在DOM中定位元素路径...`);
+  
+  // 截取前10条数据进行路径分析
+  const sampleData = dataValues.slice(0, 10);
+  
+  const elementPaths = [];
+  for (const value of sampleData) {
+    const result = await sendMessageToContent(tabId, {
+      action: 'findElementPath',
+      text: value,
+      maxLength: 30
+    });
+    
+    if (result && result.path) {
+      elementPaths.push({
+        text: value.substring(0, 30),
+        path: result.path,
+        tag: result.tag,
+        id: result.id,
+        className: result.className,
+        attributes: result.attributes || {}
+      });
+    }
+  }
+  
+  sendProgress(`✅ 定位到 ${elementPaths.length} 个元素路径`);
+  
+  if (elementPaths.length === 0) {
+    sendProgress(`⚠️ DOM定位失败，回退到LLM分析`);
+    return await generateSelectorByLLM(layerPath, userRequirement, extractedData, htmlSegment, sendProgress);
+  }
+  
+  // 第三步：分析公共路径，生成最佳选择器
+  sendProgress(`📋 分析公共路径和候选选择器...`);
+  
+  const candidates = [];
+  const isImage = userRequirement.includes('图片') || userRequirement.includes('img') || userRequirement.includes('photo');
+  
+  // 策略1：ID选择器
+  const ids = elementPaths.filter(e => e.id).map(e => `#${e.id}`);
+  if (ids.length > 0) {
+    candidates.push({ selector: ids[0], type: 'id', count: ids.length });
+  }
+  
+  // 策略2：提取元素路径中的所有class，生成更灵活的候选
+  const allClasses = [];
+  const allTags = [];
+  
+  for (const e of elementPaths) {
+    // 从 className 提取
+    if (e.className) {
+      const classes = e.className.split(/\s+/).filter(c => c && c.length < 50);
+      allClasses.push(...classes);
+    }
+    
+    // 从 path 提取 class（如 body > div.main > img.pic 格式）
+    if (e.path) {
+      const pathClasses = e.path.match(/\.([\w-]+)/g) || [];
+      for (const c of pathClasses) {
+        allClasses.push(c.substring(1));
+      }
+      
+      // 提取 tag
+      const tags = e.path.match(/>\s*([a-z][\w-]*)/gi) || [];
+      for (const t of tags) {
+        const tag = t.replace(/[>\s]/g, '').toLowerCase();
+        if (tag && tag.length < 20) allTags.push(tag);
+      }
+    }
+    
+    // 从 attributes 提取
+    for (const [key, val] of Object.entries(e.attributes || {})) {
+      if (key.startsWith('data-') && val) {
+        allClasses.push(val);
+      }
+    }
+  }
+  
+  // 过滤掉无意义的 class（浏览器内核、UA 相关）
+  const uniqueClasses = [...new Set(allClasses)];
+  const filteredClasses = uniqueClasses.filter(cls => {
+    const lower = cls.toLowerCase();
+    // 排除浏览器相关的 class
+    if (/^(ks-|webkit|chrome|firefox|safari|gecko|trident|edge|presto|blink|version|browser|os|platform|device|mobile|desktop)/.test(lower)) {
+      return false;
+    }
+    // 排除包含数字过多或太长的
+    if (cls.length > 30 || (cls.length > 15 && /\d{3,}/.test(cls))) {
+      return false;
+    }
+    // 排除纯数字或随机 hash
+    if (/^[0-9]+$/.test(cls) || /^[a-f0-9]{20,}$/i.test(cls)) {
+      return false;
+    }
+    return cls.length > 2;
+  });
+  
+  const uniqueFilteredClasses = [...new Set(filteredClasses)];
+  sendProgress(`📋 提取到 ${uniqueFilteredClasses.length} 个有效候选class: ${uniqueFilteredClasses.slice(0, 5).join(', ')}...`);
+  
+  // 生成 class 选择器候选
+  for (const cls of uniqueFilteredClasses) {
+    candidates.push({ selector: `.${cls}`, type: 'class', count: 1 });
+  }
+  
+  // 生成 tag 选择器候选（如果是图片）
+  if (isImage) {
+    const imgClasses = filteredClasses.filter(c => /pic|img|photo|origin|main/i.test(c));
+    for (const cls of imgClasses) {
+      candidates.push({ selector: `img.${cls}`, type: 'img-class', count: 1 });
+    }
+    candidates.push({ selector: 'img', type: 'img-tag', count: 1 });
+  }
+  
+  // 策略3：完整路径选择器（去除了 nth-of-type 的简化版）
+  const simplifiedPaths = elementPaths.map(p => {
+    return p.path.replace(/:nth-of-type\(\d+\)/g, '');
+  });
+  const commonSimplifiedPath = findCommonPath(simplifiedPaths);
+  if (commonSimplifiedPath) {
+    candidates.push({ selector: commonSimplifiedPath, type: 'simplified-path', count: 1 });
+  }
+  
+  // 策略4：基于层级路径生成选择器
+  if (layerPath) {
+    candidates.push({ selector: layerPath, type: 'layer-path', count: 1 });
+    // 如果是图片，添加层级+img
+    if (isImage) {
+      candidates.push({ selector: `${layerPath} img`, type: 'layer-img', count: 1 });
+    }
+  }
+  
+  // 去重候选
+  const seen = new Set();
+  const uniqueCandidates = candidates.filter(c => {
+    if (seen.has(c.selector)) return false;
+    seen.add(c.selector);
+    return true;
+  });
+  
+  sendProgress(`📋 生成 ${uniqueCandidates.length} 个候选选择器`);
+  
+  // 第四步：验证每个候选选择器
+  sendProgress(`🔬 验证 ${uniqueCandidates.length} 个候选选择器...`);
+  
+  const validatedCandidates = [];
+  for (const candidate of uniqueCandidates) {
+    const result = await sendMessageToContent(tabId, {
+      action: 'validateSelector',
+      selector: candidate.selector
+    });
+    
+    if (result && result.valid) {
+      const accuracy = calculateAccuracy(result.count, dataValues.length);
+      validatedCandidates.push({
+        ...candidate,
+        matchCount: result.count,
+        accuracy: accuracy,
+        samples: result.samples || []
+      });
+      sendProgress(`  - ${candidate.selector}: 匹配${result.count}次, 准确度${accuracy}%`);
+    }
+  }
+  
+  if (validatedCandidates.length === 0) {
+    sendProgress(`⚠️ 候选选择器验证失败，回退到LLM`);
+    return await generateSelectorByLLM(layerPath, userRequirement, extractedData, htmlSegment, sendProgress);
+  }
+  
+  // 第五步：排序选择最佳
+  // 对于图片提取，优先选择匹配数量多的选择器（能提取更多数据）
+  if (isImage) {
+    validatedCandidates.sort((a, b) => {
+      // 优先 matchCount 多的
+      if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount;
+      // 其次 accuracy 高的
+      if (b.accuracy !== a.accuracy) return b.accuracy - a.accuracy;
+      // 选择器更具体的优先（长度更长）
+      return b.selector.length - a.selector.length;
+    });
+  } else {
+    // 非图片：按准确度优先
+    validatedCandidates.sort((a, b) => {
+      if (b.accuracy !== a.accuracy) return b.accuracy - a.accuracy;
+      if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount;
+      return b.count - a.count;
+    });
+  }
+  
+  const best = validatedCandidates[0];
+  sendProgress(`✅ 最佳选择器: ${best.selector} (匹配${best.matchCount}次, 准确度${best.accuracy}%)`);
+  
+  // 第六步：分析懒加载属性和过滤模式
+  sendProgress(`🔍 分析懒加载模式和噪音过滤...`);
+  
+  const analyzeResult = await analyzeLazyAndFilter(tabId, best.selector, userRequirement, sendProgress);
+  
+  globalLazyAttr = analyzeResult.lazyAttr;
+  globalFilterPatterns = analyzeResult.filterPatterns;
+  
+  sendProgress(`📋 懒加载属性: ${globalLazyAttr}`);
+  sendProgress(`📋 过滤模式: ${globalFilterPatterns.join(', ')}`);
+  
+  return best.selector;
+}
+
+// 分析class模式，找出公共class组合
+function analyzeClassPatterns(elementPaths) {
+  const patterns = [];
+  
+  // 提取所有class列表
+  const classLists = elementPaths.map(e => {
+    if (e.className) {
+      return e.className.split(/\s+/).filter(c => c && c.length < 30);
+    }
+    return [];
+  });
+  
+  // 找出所有路径中的class
+  const pathClasses = elementPaths.map(e => {
+    const match = e.path.match(/class="([^"]+)"/g) || [];
+    return match.map(m => m.match(/class="([^"]+)"/)?.[1]).filter(Boolean);
+  }).flat();
+  
+  // 生成多种class组合
+  const allClasses = [...new Set(pathClasses)];
+  if (allClasses.length > 0) {
+    // 单class选择器
+    for (const cls of allClasses) {
+      patterns.push({ selector: `.${cls}`, type: 'class', count: pathClasses.filter(c => c === cls).length });
+    }
+    
+    // 双class组合
+    for (let i = 0; i < allClasses.length; i++) {
+      for (let j = i + 1; j < allClasses.length; j++) {
+        patterns.push({
+          selector: `.${allClasses[i]}.${allClasses[j]}`,
+          type: 'class-combination',
+          count: pathClasses.filter(c => c === allClasses[i] || c === allClasses[j]).length
+        });
+      }
+    }
+  }
+  
+  // 从完整路径提取class模式
+  for (const e of elementPaths) {
+    const pathMatch = e.path.match(/[\w-]+\.[\w-.]+/g);
+    if (pathMatch) {
+      for (const match of pathMatch) {
+        const classes = match.split('.').filter(c => c && !c.match(/^\d/));
+        if (classes.length >= 1) {
+          const selector = '.' + classes.join('.');
+          if (!patterns.some(p => p.selector === selector)) {
+            patterns.push({ selector, type: 'path-class', count: 1 });
+          }
+        }
+      }
+    }
+  }
+  
+  return patterns;
+}
+
+// 找出公共路径
+function findCommonPath(paths) {
+  if (paths.length === 0) return null;
+  if (paths.length === 1) return paths[0];
+  
+  const parts = paths[0].split(' > ');
+  let commonParts = [parts[0]];
+  
+  for (let i = 1; i < parts.length; i++) {
+    const nextParts = paths.map(p => p.split(' > ')[i]).filter(Boolean);
+    if (nextParts.every(p => p === nextParts[0])) {
+      commonParts.push(nextParts[0]);
+    } else {
+      break;
+    }
+  }
+  
+  if (commonParts.length >= 2) {
+    return commonParts.join(' > ');
+  }
+  
+  return null;
+}
+
+// 计算准确度
+function calculateAccuracy(matchCount, expectedCount) {
+  if (matchCount === 0) return 0;
+  if (matchCount === expectedCount) return 100;
+  
+  const ratio = Math.min(matchCount, expectedCount) / Math.max(matchCount, expectedCount);
+  return Math.round(ratio * 100);
+}
+
+// 分析懒加载属性和过滤模式
+async function analyzeLazyAndFilter(tabId, selector, userRequirement, sendProgress) {
+  const isImage = userRequirement.includes('图片') || userRequirement.includes('img') || userRequirement.includes('photo');
+  
+  if (!isImage) {
+    return { lazyAttr: 'src', filterPatterns: [] };
+  }
+  
+  const result = await sendMessageToContent(tabId, {
+    action: 'findElements',
+    selector: selector
+  });
+  
+  if (!result || !result.elements || result.elements.length === 0) {
+    return { lazyAttr: 'src', filterPatterns: ['tps-', 'badge', 'icon', 'label'] };
+  }
+  
+  const elements = result.elements.slice(0, 5);
+  
+  // 分析懒加载属性
+  const attrCounts = {};
+  for (const el of elements) {
+    for (const [key] of Object.entries(el.attributes || {})) {
+      attrCounts[key] = (attrCounts[key] || 0) + 1;
+    }
+  }
+  
+  const sortedAttrs = Object.entries(attrCounts).sort((a, b) => b[1] - a[1]);
+  const likelyLazyAttr = sortedAttrs.find(([key]) => 
+    ['data-src', 'data-original', 'data-lazy-src', 'data-srcset', 'srcset', 'data-url'].includes(key)
+  )?.[0] || 'src';
+  
+  // 过滤模式
+  const filterPatterns = ['tps-', 'badge', 'icon', 'label', '!!600000000'];
+  
+  return {
+    lazyAttr: likelyLazyAttr,
+    filterPatterns: filterPatterns
+  };
+}
+
+// 回退到LLM分析
+async function generateSelectorByLLM(layerPath, userRequirement, extractedData, htmlSegment, sendProgress) {
+  sendProgress(`🤖 回退到LLM分析...`);
   
   const messages = [
-    { role: 'system', content: `你是一个网页数据提取专家。你需要分析HTML片段，找出包含目标数据的最佳选择器，并分析懒加载模式。
-
-任务：
-1. 找到包含用户需要的数据的元素
-2. 分析该元素的懒加载模式（真实URL在哪个属性中）
-3. 识别需要过滤的非目标数据（如广告图、标签图）
+    { role: 'system', content: `你是一个网页数据提取专家。分析HTML片段，找出包含目标数据的最佳选择器。
 
 输出格式（必须严格按此JSON格式）：
 {
   "selector": "CSS选择器",
-  "lazyAttr": "懒加载属性名（如data-src, data-original, srcset等，如果src就是真实用data-src等）",
-  "filterPatterns": ["需要过滤的URL关键词数组，如tps-, badge, icon等"],
-  "reason": "简要说明为什么这样选择"
+  "lazyAttr": "懒加载属性名",
+  "filterPatterns": ["需要过滤的URL关键词数组"],
+  "reason": "简要说明"
 }
 
-重要规则：
-1. 选择器必须精确指向目标元素，避免选中广告/标签/图标
-2. 分析HTML中img标签的所有属性，找出真实URL所在
-3. 如果有多张图片，分析它们的共同特征（class包含pic/main/origin的更可能是商品图）
-4. 如果是图片链接：过滤掉包含icon/badge/label/tps-/官方活动等关键词的URL
-5. 如果extractedData不为空，必须在HTML中找到这些数据的对应元素
-6. 输出必须是合法JSON，不要有其他内容` },
+重要：
+1. 选择器必须精确指向目标元素
+2. 如果是图片，找出真实URL所在属性
+3. 输出必须是合法JSON` },
     { role: 'user', content: `用户需求：${userRequirement}
 层级路径：${layerPath}
-
-HTML片段（包含实际数据）：
-${htmlSegment.substring(0, 10000)}
-
-${extractedData ? `已成功提取到的数据（用于在HTML中定位正确的元素）：
-${extractedData}
-
-` : ''}
-请分析HTML，找出最佳选择器和懒加载属性。` }
+HTML片段：${htmlSegment.substring(0, 8000)}
+已提取数据：${extractedData.substring(0, 1000)}` }
   ];
   
   try {
-    sendProgress(`🤖 LLM正在分析...`);
     const rawResult = await callLLM(messages);
-    sendProgress(`✅ 分析完成，正在解析...`);
+    const jsonMatch = rawResult.match(/\{[\s\S]*\}/);
     
-    // 尝试解析JSON
-    let selector = '';
-    let lazyAttr = 'src';
-    let filterPatterns = ['tps-', 'badge', 'icon', 'label', '!!600000000', '!!6000000000000'];
-    
-    try {
-      const jsonMatch = rawResult.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const info = JSON.parse(jsonMatch[0]);
-        selector = info.selector || '';
-        lazyAttr = info.lazyAttr || 'src';
-        filterPatterns = info.filterPatterns || filterPatterns;
-        sendProgress(`📋 懒加载属性: ${lazyAttr}, 过滤: ${filterPatterns.join(', ')}`);
-      }
-    } catch (e) {
-      sendProgress(`⚠️ 解析JSON失败，尝试提取选择器...`);
-      // 如果JSON解析失败，尝试直接提取选择器
-      selector = rawResult.match(/[a-zA-Z][\w\s\-:>.,#*\[\]='"~^$|=]+img|\w+[\s>]+img|\.[\w\-]+[\s>]+img|#[\w\-]+[\s>]+img/g)?.[0] || '';
+    if (jsonMatch) {
+      const info = JSON.parse(jsonMatch[0]);
+      globalLazyAttr = info.lazyAttr || 'src';
+      globalFilterPatterns = info.filterPatterns || ['tps-', 'badge', 'icon'];
+      sendProgress(`📋 LLM分析: 选择器=${info.selector}, 懒加载=${globalLazyAttr}`);
+      return info.selector || '';
     }
-    
-    if (!selector) {
-      sendProgress(`⚠️ 无法生成选择器`);
-      return '';
-    }
-    
-    // 返回选择器（懒加载属性和过滤规则存储到全局变量）
-    globalLazyAttr = lazyAttr;
-    globalFilterPatterns = filterPatterns;
-    
-    return selector.trim();
   } catch (e) {
-    sendProgress(`⚠️ 生成选择器失败: ${e.message}`);
-    return '';
+    sendProgress(`⚠️ LLM分析失败: ${e.message}`);
   }
+  
+  return '';
+}
+
+// 发送消息到content script的辅助函数
+function sendMessageToContent(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      resolve(response);
+    });
+  });
 }
 
 // 使用选择器快速提取数据
