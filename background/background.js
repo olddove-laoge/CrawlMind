@@ -267,12 +267,21 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
     let messages = [
       { role: 'system', content: `你是一个网页结构分析助手。根据用户需求"${userRequirement}"，分析HTML树形结构。
 
+重要提示：
+1. HTML中的 <#shadow-root> 是 Shadow DOM 的占位符标记，表示进入 Web Component 的 Shadow DOM
+2. Shadow DOM 路径格式：使用 " >> " 分隔不同 Shadow DOM 层级的选择器
+3. 例如：bili-comments >> #feed > bili-comment-thread-renderer >> #comment 表示：
+   - 先选择 bili-comments
+   - 进入其 shadowRoot，查找 #feed
+   - 进入 #feed 的 shadowRoot，查找 bili-comment-thread-renderer
+   - 进入其 shadowRoot，查找 #comment
+
 请严格按照以下格式输出：
 ---分析开始---
-[在这里详细描述你观察到的HTML结构，特别是哪些标签、class、id可能包含目标数据]
+[在这里详细描述你观察到的HTML结构，特别是哪些标签、class、id可能包含目标数据。注意 <#shadow-root> 表示 Shadow DOM 边界]
 
 ---层级判断---
-{"层级路径": "如 div.product-list > ul > li", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false, "当前深度": 数字, "理由": "为什么选择这个层级"}` },
+{"层级路径": "使用 >> 表示 Shadow DOM 边界，如 bili-comments >> #feed 或 div#commentapp > bili-comments >> #contents", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false, "当前深度": 数字, "理由": "为什么选择这个层级"}` },
       { role: 'user', content: `用户需求：${userRequirement}\n\nHTML结构（完整框架，不含文本内容，共${fullFramework.length}字符）：\n${fullFramework}` }
     ];
     
@@ -339,7 +348,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
       let segment = fullContent.substring(offset, offset + 20000);
       if (!segment) break;
       
-      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}，当前偏移${offset}）：\n${segment}\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察是否包含用户需要的数据（可能是文本、链接、图片、价格、评论、标题、音频、视频、文件等任何内容）]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "如 div.class", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
+      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}，当前偏移${offset}）：\n${segment}\n\n重要：<#shadow-root> 是 Shadow DOM 边界标记，路径中使用 " >> " 表示进入 Shadow DOM。\n例如：bili-comments >> #feed > bili-comment-renderer\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察是否包含用户需要的数据（可能是文本、链接、图片、价格、评论、标题、音频、视频、文件等任何内容）]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "使用 >> 表示 Shadow DOM，如 bili-comments >> #comment", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
       
       sendProgressToPage(`🤖 LLM正在分析深度${currentDepth + 1}...`);
       sendProgressToPage(`💭 思考中: 检查深度${currentDepth + 1}是否包含目标数据...`);
@@ -581,9 +590,16 @@ async function getDetailedResult(treeText, userRequirement, maxChars, sendProgre
   return result;
 }
 
-// 根据层级路径提取数据（支持offset）
+// 根据层级路径提取数据（支持offset和Shadow DOM）
 async function extractByLayer(treeText, userRequirement, layerPath, tabId, sendProgress, startOffset = 0) {
   sendProgress(`🎯 根据层级路径 "${layerPath}" 提取数据 (从位置${startOffset}开始)...`);
+  
+  // 解析 Shadow DOM 路径
+  const pathInfo = parseShadowPath(layerPath);
+  if (pathInfo.hasShadowDOM) {
+    sendProgress(`🔮 检测到 Shadow DOM 路径: light DOM="${pathInfo.simplePath}", shadow="${pathInfo.shadowParts.join('" >> "')}"`);
+    globalSelector = layerPath; // 保存完整路径
+  }
   
   // 让LLM根据用户需求自动判断输出格式
   let formatMessages = [
@@ -1288,12 +1304,17 @@ async function detectLayerPath(treeText, userRequirement, sendProgress) {
   const messages = [
     { role: 'system', content: `你是一个网页结构分析助手。根据用户需求"${userRequirement}"，分析HTML树形结构，找出包含目标数据的层级路径。
 
+重要：
+1. <#shadow-root> 是 Shadow DOM 的占位符标记
+2. 路径中使用 " >> " 分隔不同 Shadow DOM 层级
+3. 例如：bili-comments >> #feed 表示进入 bili-comments 的 shadowRoot 查找 #feed
+
 请严格按照以下格式输出：
 ---分析开始---
 [详细描述你观察到的HTML结构，特别是哪些标签、class、id可能包含目标数据]
 
 ---层级判断---
-{"层级路径": "如 div.product-list > ul > li", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false}` },
+{"层级路径": "使用 >> 表示 Shadow DOM 边界，如 bili-comments >> #feed > bili-comment-renderer", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false}` },
     { role: 'user', content: `用户需求：${userRequirement}\n\nHTML结构（前${segment.length}字符）：\n${segment}` }
   ];
   
@@ -1357,15 +1378,23 @@ async function generateSelector(layerPath, userRequirement, extractedData, htmlS
       elementPaths.push({
         text: value.substring(0, 30),
         path: result.path,
+        fullPath: result.fullPath || '',
         tag: result.tag,
         id: result.id,
         className: result.className,
-        attributes: result.attributes || {}
+        attributes: result.attributes || {},
+        hasShadowDOM: result.hasShadowDOM || false
       });
     }
   }
   
   sendProgress(`✅ 定位到 ${elementPaths.length} 个元素路径`);
+  
+  // 检查是否有 Shadow DOM 元素
+  const hasShadowElements = elementPaths.some(e => e.hasShadowDOM);
+  if (hasShadowElements) {
+    sendProgress(`🔮 检测到 ${elementPaths.filter(e => e.hasShadowDOM).length} 个 Shadow DOM 元素`);
+  }
   
   if (elementPaths.length === 0) {
     sendProgress(`⚠️ DOM定位失败，回退到LLM分析`);
@@ -1469,6 +1498,15 @@ async function generateSelector(layerPath, userRequirement, extractedData, htmlS
     // 如果是图片，添加层级+img
     if (isImage) {
       candidates.push({ selector: `${layerPath} img`, type: 'layer-img', count: 1 });
+    }
+  }
+  
+  // 策略5：Shadow DOM 完整路径（优先级最高）
+  if (hasShadowElements) {
+    const fullPaths = elementPaths.filter(e => e.fullPath).map(e => e.fullPath);
+    const uniqueFullPaths = [...new Set(fullPaths)];
+    for (const fp of uniqueFullPaths) {
+      candidates.push({ selector: fp, type: 'shadow-path', count: 1, isShadowPath: true });
     }
   }
   
@@ -1729,6 +1767,28 @@ function sendMessageToContent(tabId, message) {
   });
 }
 
+// 解析 Shadow DOM 路径（如 "bili-comments >> #feed > bili-comment"）
+function parseShadowPath(layerPath) {
+  if (!layerPath || !layerPath.includes('>>')) {
+    return { hasShadowDOM: false, simplePath: layerPath, shadowParts: [] };
+  }
+  
+  const parts = layerPath.split('>>').map(p => p.trim());
+  const shadowParts = [];
+  
+  for (let i = 1; i < parts.length; i++) {
+    // 每个 Shadow DOM 部分
+    shadowParts.push(parts[i]);
+  }
+  
+  return {
+    hasShadowDOM: true,
+    simplePath: parts[0], // light DOM 路径
+    shadowParts: shadowParts,
+    fullPath: layerPath
+  };
+}
+
 // 使用选择器快速提取数据
 async function extractBySelector(tabId, userRequirement, formatLabel, sendProgress) {
   if (!globalSelector) {
@@ -1737,7 +1797,32 @@ async function extractBySelector(tabId, userRequirement, formatLabel, sendProgre
   
   sendProgress(`🔍 使用选择器快速提取: ${globalSelector}`);
   
-  // 在content script中执行选择器，传递懒加载属性和过滤规则
+  // 检查是否是 Shadow DOM 路径
+  const pathInfo = parseShadowPath(globalSelector);
+  
+  if (pathInfo.hasShadowDOM) {
+    sendProgress(`🔮 使用 Shadow DOM 路径提取...`);
+    
+    // 使用专门的 Shadow DOM 提取消息
+    return new Promise((resolve) => {
+      chrome.tabs.sendMessage(tabId, {
+        action: 'extractByShadowPath',
+        simplePath: pathInfo.simplePath,
+        shadowParts: pathInfo.shadowParts,
+        requirement: userRequirement,
+        lazyAttr: globalLazyAttr,
+        filterPatterns: globalFilterPatterns
+      }, (response) => {
+        if (response && response.data) {
+          resolve(response.data);
+        } else {
+          resolve(null);
+        }
+      });
+    });
+  }
+  
+  // 普通选择器提取
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, {
       action: 'extractBySelector',

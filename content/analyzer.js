@@ -488,6 +488,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ elements: results });
   }
   
+  // 使用 Shadow DOM 路径提取数据
+  if (request.action === 'extractByShadowPath') {
+    const { simplePath, shadowParts, requirement, lazyAttr, filterPatterns } = request;
+    const data = extractByShadowPath(simplePath, shadowParts, requirement, lazyAttr, filterPatterns);
+    sendResponse({ data: data });
+    return true;
+  }
+  
   // 验证选择器
   if (request.action === 'validateSelector') {
     const result = validateSelectorOnPage(request.selector);
@@ -508,20 +516,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const filterPatterns = request.filterPatterns || [];
     
     try {
-      const elements = document.querySelectorAll(selector);
+      const results = querySelectorAllDeep(selector);
       const data = [];
       
       // 根据需求判断要提取什么
       const isImage = requirement.includes('图片') || requirement.includes('img') || requirement.includes('photo');
       const isLink = requirement.includes('链接') || requirement.includes('href');
       
-      for (const el of elements) {
+      for (const { element } of results) {
         let value = '';
         
         if (isImage) {
-          let imgEl = el;
-          if (el.tagName === 'A' || el.tagName === 'DIV') {
-            imgEl = el.querySelector('img') || el;
+          let imgEl = element;
+          if (element.tagName === 'A' || element.tagName === 'DIV') {
+            imgEl = element.querySelector('img') || element;
           }
           
           if (imgEl.tagName === 'IMG') {
@@ -556,13 +564,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               }
             }
           }
-        } else if (isLink && el.tagName === 'A') {
-          value = el.href || '';
+        } else if (isLink && element.tagName === 'A') {
+          value = element.href || '';
         }
         
         // 如果没有提取到特殊属性，提取文本
         if (!value) {
-          value = el.textContent.trim();
+          value = element.textContent.trim();
         }
         
         // 过滤无效数据和需要排除的图片
@@ -573,7 +581,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
         }
       }
-      sendResponse({ data: data });
+      sendResponse({ data: data, count: results.length });
     } catch (e) {
       sendResponse({ error: e.message });
     }
@@ -585,50 +593,463 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // ==================== 精确选择器生成 ====================
 
-function findElementByText(text, maxLength = 50) {
-  if (!text || text.length < 2) return null;
+function findAllElementsDeep(root = document) {
+  const elements = [];
+  const stack = [{ node: root, shadowPath: [] }];
   
-  const truncatedText = text.substring(0, maxLength);
-  const allElements = document.querySelectorAll('*');
-  
-  for (const el of allElements) {
-    const elText = el.textContent.trim().replace(/\s+/g, ' ');
-    if (elText.includes(truncatedText) || truncatedText.includes(elText.substring(0, 30))) {
-      const path = getElementPath(el);
-      const uniqueAttrs = getUniqueAttrs(el);
-      const tag = el.tagName.toLowerCase();
-      
-      return {
-        path: path,
-        tag: tag,
-        id: el.id || '',
-        className: typeof el.className === 'string' ? el.className : '',
-        attributes: uniqueAttrs,
-        text: elText.substring(0, 100),
-        rect: el.getBoundingClientRect()
-      };
+  while (stack.length > 0) {
+    const { node, shadowPath } = stack.pop();
+    
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      elements.push({ element: node, shadowPath: shadowPath });
+    }
+    
+    if (node.shadowRoot) {
+      for (const child of node.shadowRoot.children) {
+        stack.push({ node: child, shadowPath: [...shadowPath, node] });
+      }
+    }
+    
+    if (node.children) {
+      for (const child of node.children) {
+        stack.push({ node: child, shadowPath: shadowPath });
+      }
     }
   }
-  return null;
+  
+  return elements;
 }
 
-function getElementPath(element) {
+function querySelectorFromFullPath(fullPath) {
+  const results = [];
+  
+  try {
+    // 解析路径: document.querySelector("bili-comments").shadowRoot.querySelector("#feed > bili-comment-thread-renderer:nth-child(9)")
+    const selectors = [];
+    
+    // 提取第一个选择器
+    const mainMatch = fullPath.match(/document\.querySelector\("([^"]+)"\)/);
+    if (mainMatch) {
+      selectors.push(mainMatch[1]);
+    }
+    
+    // 提取所有 shadowRoot.querySelector 中的选择器
+    const shadowMatches = fullPath.matchAll(/\.shadowRoot\.querySelector\("([^"]+)"\)/g);
+    for (const match of shadowMatches) {
+      selectors.push(match[1]);
+    }
+    
+    if (selectors.length === 0) return results;
+    
+    // 递归查找函数
+    function findInShadow(element, selectorIndex, currentShadowPath) {
+      if (selectorIndex >= selectors.length) {
+        results.push({ element: element, shadowPath: [...currentShadowPath] });
+        return;
+      }
+      
+      const selector = selectors[selectorIndex];
+      const parts = selector.split('>').map(s => s.trim());
+      
+      if (parts.length === 1 && !selector.includes(':nth-of-type')) {
+        // 简单选择器，直接使用 querySelector
+        if (element.shadowRoot) {
+          const found = element.shadowRoot.querySelector(selector);
+          if (found) {
+            currentShadowPath.push(element);
+            findInShadow(found, selectorIndex + 1, currentShadowPath);
+          }
+        }
+      } else {
+        // 复合选择器，需要逐层查找
+        if (element.shadowRoot) {
+          const allElements = element.shadowRoot.querySelectorAll('*');
+          const matched = [];
+          
+          for (const el of allElements) {
+            if (matchesSelector(el, selector)) {
+              matched.push(el);
+            }
+          }
+          
+          // 如果选择器包含 :nth-of-type，匹配特定元素
+          const nthMatch = selector.match(/:nth-of-type\((\d+)\)/);
+          let targetEl = null;
+          
+          if (nthMatch) {
+            const nth = parseInt(nthMatch[1]) - 1;
+            if (nth >= 0 && nth < matched.length) {
+              targetEl = matched[nth];
+            }
+          } else {
+            targetEl = matched[0];
+          }
+          
+          if (targetEl) {
+            currentShadowPath.push(element);
+            findInShadow(targetEl, selectorIndex + 1, currentShadowPath);
+          }
+        }
+      }
+    }
+    
+    // 从第一个选择器开始
+    const firstSelector = selectors[0];
+    const firstParts = firstSelector.split('>').map(s => s.trim());
+    
+    if (firstParts.length === 1 && !firstSelector.includes(':nth-of-type')) {
+      const firstElements = document.querySelectorAll(firstSelector);
+      for (const el of firstElements) {
+        findInShadow(el, 1, []);
+      }
+    } else {
+      // 第一个选择器也是复合的
+      const allElements = document.querySelectorAll('*');
+      const matched = [];
+      
+      for (const el of allElements) {
+        if (matchesSelector(el, firstSelector)) {
+          matched.push(el);
+        }
+      }
+      
+      const nthMatch = firstSelector.match(/:nth-of-type\((\d+)\)/);
+      let targetEl = null;
+      
+      if (nthMatch) {
+        const nth = parseInt(nthMatch[1]) - 1;
+        if (nth >= 0 && nth < matched.length) {
+          targetEl = matched[nth];
+        }
+      } else {
+        targetEl = matched[0];
+      }
+      
+      if (targetEl) {
+        findInShadow(targetEl, 1, []);
+      }
+    }
+  } catch (e) {
+    console.error('Error parsing full path:', e);
+  }
+  
+  return results;
+}
+
+function matchesSelector(element, selector) {
+  try {
+    // 解析复合选择器（如 "#feed > bili-comment-thread-renderer:nth-child(9)"）
+    const parts = selector.split('>').map(s => s.trim());
+    
+    // 检查是否匹配所有部分
+    let current = element;
+    
+    // 从后往前匹配
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const part = parts[i].replace(/:nth-of-type\(\d+\)/, '').trim();
+      
+      const tagMatch = part.match(/^([a-z][\w-]*)/i);
+      const idMatch = part.match(/#([\w-]+)/);
+      const classMatches = part.match(/\.([\w-]+)/g) || [];
+      
+      // 检查标签
+      if (tagMatch) {
+        if (current.tagName.toLowerCase() !== tagMatch[1].toLowerCase()) return false;
+      }
+      
+      // 检查 ID
+      if (idMatch) {
+        if (current.id !== idMatch[1]) return false;
+      }
+      
+      // 检查 class
+      for (const classMatch of classMatches) {
+        const cls = classMatch.substring(1);
+        if (!current.className || !current.className.includes(cls)) return false;
+      }
+      
+      // 移动到父元素
+      if (i > 0 && current.parentElement) {
+        current = current.parentElement;
+      }
+    }
+    
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function querySelectorByShadowPath(shadowPath) {
+  // 处理 >> 格式的 Shadow DOM 路径
+  // 例如: bili-comments >> #feed > bili-comment-thread-renderer >> #comment
+  const results = [];
+  const parts = shadowPath.split(' >> ').map(p => p.trim());
+  
+  if (parts.length === 0) return results;
+  
+  try {
+    // 解析第一个选择器（light DOM）
+    const firstSelector = parts[0];
+    let candidates = Array.from(document.querySelectorAll(firstSelector));
+    
+    console.log('CrawlMind querySelectorByShadowPath step 0:', firstSelector, 'found', candidates.length);
+    
+    if (candidates.length === 0) {
+      console.log('CrawlMind: No elements found for:', firstSelector);
+      return results;
+    }
+    
+    // 逐层遍历 Shadow DOM
+    for (let i = 1; i < parts.length; i++) {
+      const shadowPart = parts[i];
+      const nextCandidates = [];
+      
+      console.log('CrawlMind step', i, ':', shadowPart, 'candidates:', candidates.length);
+      
+      for (const candidate of candidates) {
+        if (!candidate.shadowRoot) {
+          console.log('CrawlMind: no shadowRoot on', candidate.tagName);
+          continue;
+        }
+        
+        // 解析选择器（可能包含多个用 > 分隔的部分）
+        const selectors = shadowPart.split('>').map(s => s.trim());
+        let currentElements = [candidate.shadowRoot];
+        
+        for (const sel of selectors) {
+          if (!sel) continue;
+          
+          const nextElements = [];
+          for (const curr of currentElements) {
+            try {
+              const matched = curr.querySelectorAll(sel);
+              console.log('CrawlMind: querySelector', sel, 'found', matched.length);
+              nextElements.push(...matched);
+            } catch (e) {
+              console.log('CrawlMind: querySelector error:', e.message);
+            }
+          }
+          currentElements = nextElements;
+        }
+        
+        nextCandidates.push(...currentElements);
+      }
+      
+      console.log('CrawlMind step', i, 'result:', nextCandidates.length);
+      candidates = nextCandidates;
+      
+      if (candidates.length === 0) break;
+    }
+    
+    // 收集最终结果
+    for (const el of candidates) {
+      results.push({ element: el, shadowPath: [] });
+    }
+    
+    console.log('CrawlMind querySelectorByShadowPath final:', results.length, 'results');
+  } catch (e) {
+    console.error('Error in querySelectorByShadowPath:', e);
+  }
+  
+  return results;
+}
+
+function extractByShadowPath(simplePath, shadowParts, requirement, lazyAttr = 'src', filterPatterns = []) {
+  const data = [];
+  
+  try {
+    // 第一步：构建完整路径
+    const fullPath = simplePath + (shadowParts.length > 0 ? ' >> ' + shadowParts.join(' >> ') : '');
+    
+    console.log('CrawlMind extractByShadowPath:', { simplePath, shadowParts, fullPath });
+    
+    // 使用 querySelectorByShadowPath 获取元素
+    const results = querySelectorByShadowPath(fullPath);
+    
+    console.log('CrawlMind querySelectorByShadowPath results:', results.length, 'elements found');
+    
+    const isImage = requirement.includes('图片') || requirement.includes('img') || requirement.includes('photo');
+    const isLink = requirement.includes('链接') || requirement.includes('href');
+    
+    // 收集所有层级的文本内容
+    for (const { element } of results) {
+      // 递归获取所有文本
+      const texts = [];
+      collectAllText(element, texts);
+      
+      console.log('CrawlMind collected', texts.length, 'texts from element');
+      
+      for (const text of texts) {
+        if (text && text.length > 0 && text !== '[object Object]') {
+          const shouldFilter = filterPatterns.some(pattern => text.includes(pattern));
+          if (!shouldFilter) {
+            data.push(text);
+          }
+        }
+      }
+    }
+    
+    // 如果直接查找失败，尝试更激进的方法
+    if (data.length === 0 && simplePath) {
+      console.log('CrawlMind trying fallback method...');
+      const rootElements = document.querySelectorAll(simplePath);
+      console.log('CrawlMind found', rootElements.length, 'root elements');
+      
+      for (const rootEl of rootElements) {
+        // 递归收集所有文本
+        const texts = [];
+        collectAllTextDeep(rootEl, texts);
+        
+        console.log('CrawlMind fallback collected', texts.length, 'texts');
+        
+        for (const text of texts) {
+          if (text && text.length > 0 && text !== '[object Object]' && text.length > 2) {
+            const shouldFilter = filterPatterns.some(pattern => text.includes(pattern));
+            if (!shouldFilter) {
+              data.push(text);
+            }
+          }
+        }
+      }
+    }
+    
+    console.log('CrawlMind extractByShadowPath returning', data.length, 'items');
+  } catch (e) {
+    console.error('Error extracting from Shadow DOM:', e);
+  }
+  
+  return data;
+}
+
+function collectAllText(element, results) {
+  // 获取元素的文本
+  const text = element.textContent?.trim();
+  if (text) {
+    results.push(text);
+  }
+  
+  // 进入 Shadow DOM
+  if (element.shadowRoot) {
+    for (const child of element.shadowRoot.children) {
+      collectAllText(child, results);
+    }
+  }
+}
+
+function collectAllTextDeep(element, results) {
+  // 获取元素的直接文本（不包括子元素）
+  for (const node of element.childNodes) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent?.trim();
+      if (text) {
+        results.push(text);
+      }
+    }
+  }
+  
+  // 进入元素的 Shadow DOM
+  if (element.shadowRoot) {
+    for (const child of element.shadowRoot.children) {
+      collectAllTextDeep(child, results);
+    }
+  }
+  
+  // 同时遍历普通子元素
+  for (const child of element.children) {
+    collectAllTextDeep(child, results);
+  }
+}
+
+function collectAllElements(element, results) {
+  results.push(element);
+  
+  // 进入元素的 Shadow DOM
+  if (element.shadowRoot) {
+    for (const child of element.shadowRoot.children) {
+      collectAllElements(child, results);
+    }
+  }
+  
+  // 同时遍历普通子元素
+  for (const child of element.children) {
+    collectAllElements(child, results);
+  }
+}
+
+function querySelectorAllDeep(selector, root = document) {
+  // 处理 >> 格式的 Shadow DOM 路径
+  // 例如: bili-comments >> #feed > bili-comment-thread-renderer
+  if (selector.includes(' >> ')) {
+    return querySelectorByShadowPath(selector);
+  }
+  
+  const results = [];
+  const stack = [{ node: root, shadowPath: [] }];
+  
+  while (stack.length > 0) {
+    const { node, shadowPath } = stack.pop();
+    
+    try {
+      if (node.matches && node.matches(selector)) {
+        results.push({ element: node, shadowPath: shadowPath });
+      }
+    } catch (e) {}
+    
+    if (node.shadowRoot) {
+      try {
+        const shadowResults = node.shadowRoot.querySelectorAll(selector);
+        for (const el of shadowResults) {
+          results.push({ element: el, shadowPath: [...shadowPath, node] });
+        }
+      } catch (e) {}
+      
+      for (const child of node.shadowRoot.children) {
+        stack.push({ node: child, shadowPath: [...shadowPath, node] });
+      }
+    }
+    
+    if (node.children) {
+      for (const child of node.children) {
+        stack.push({ node: child, shadowPath: shadowPath });
+      }
+    }
+  }
+  
+  return results;
+}
+
+function getElementPath(element, shadowPath = []) {
   if (!element || element === document.body || element === document.documentElement) {
     return 'body';
   }
   
-  if (element.id) {
-    return `#${element.id}`;
+  const pathParts = [];
+  
+  for (const shadowHost of shadowPath) {
+    const hostTag = shadowHost.tagName.toLowerCase();
+    const hostId = shadowHost.id ? `#${shadowHost.id}` : '';
+    if (hostId) {
+      pathParts.push(`${hostTag}${hostId}.shadowRoot`);
+    } else {
+      const hostClasses = typeof shadowHost.className === 'string' 
+        ? shadowHost.className.split(/\s+/).filter(c => c && c.length < 30).slice(0, 2).join('.')
+        : '';
+      pathParts.push(`${hostTag}${hostClasses ? '.' + hostClasses : ''}.shadowRoot`);
+    }
   }
   
-  const path = [];
-  let current = element;
+  if (element.id) {
+    pathParts.push(`#${element.id}`);
+    return pathParts.join(' > ');
+  }
   
+  let current = element;
   while (current && current !== document.body && current !== document.documentElement) {
     let selector = current.tagName.toLowerCase();
     
     if (current.id) {
-      path.unshift(`#${current.id}`);
+      pathParts.push(`#${current.id}`);
       break;
     }
     
@@ -649,11 +1070,94 @@ function getElementPath(element) {
       }
     }
     
-    path.unshift(selector);
+    pathParts.push(selector);
     current = current.parentElement;
   }
   
-  return path.join(' > ') || 'body';
+  return pathParts.join(' > ') || 'body';
+}
+
+function buildFullPath(element, shadowPath = []) {
+  // 生成完整的 Shadow DOM 路径
+  // 例如: document.querySelector("#commentapp > bili-comments").shadowRoot.querySelector("#feed > bili-comment-thread-renderer")
+  
+  const parts = [];
+  
+  // 从 shadowPath 构建部分
+  for (const shadowHost of shadowPath) {
+    const tag = shadowHost.tagName.toLowerCase();
+    const id = shadowHost.id ? `#${shadowHost.id}` : '';
+    const classes = typeof shadowHost.className === 'string'
+      ? shadowHost.className.split(/\s+/).filter(c => c && c.length < 30).slice(0, 2).map(c => `.${c}`).join('')
+      : '';
+    
+    if (id) {
+      parts.push(`${tag}${id}`);
+    } else if (classes) {
+      parts.push(`${tag}${classes}`);
+    } else {
+      parts.push(tag);
+    }
+  }
+  
+  // 添加目标元素
+  const targetTag = element.tagName.toLowerCase();
+  const targetId = element.id ? `#${element.id}` : '';
+  const targetClasses = typeof element.className === 'string'
+    ? element.className.split(/\s+/).filter(c => c && c.length < 30).slice(0, 2).map(c => `.${c}`).join('')
+    : '';
+  
+  if (targetId) {
+    parts.push(`${targetTag}${targetId}`);
+  } else if (targetClasses) {
+    parts.push(`${targetTag}${targetClasses}`);
+  } else {
+    parts.push(targetTag);
+  }
+  
+  // 构建最终路径
+  // 使用 >> 表示进入 Shadow DOM
+  if (parts.length === 0) {
+    return 'document';
+  }
+  
+  let result = parts[0];
+  for (let i = 1; i < parts.length; i++) {
+    result += ` >> ${parts[i]}`;
+  }
+  
+  return result;
+}
+
+function findElementByText(text, maxLength = 50) {
+  if (!text || text.length < 2) return null;
+  
+  const truncatedText = text.substring(0, maxLength);
+  
+  const allElements = findAllElementsDeep();
+  
+  for (const { element, shadowPath } of allElements) {
+    const elText = element.textContent.trim().replace(/\s+/g, ' ');
+    if (elText.includes(truncatedText) || truncatedText.includes(elText.substring(0, 30))) {
+      const path = getElementPath(element, shadowPath);
+      const fullPath = buildFullPath(element, shadowPath);
+      const uniqueAttrs = getUniqueAttrs(element);
+      const tag = element.tagName.toLowerCase();
+      
+      return {
+        path: path,
+        fullPath: fullPath,
+        tag: tag,
+        id: element.id || '',
+        className: typeof element.className === 'string' ? element.className : '',
+        attributes: uniqueAttrs,
+        text: elText.substring(0, 100),
+        rect: element.getBoundingClientRect ? element.getBoundingClientRect() : { top: 0, left: 0, width: 0, height: 0 },
+        hasShadowDOM: shadowPath.length > 0
+      };
+    }
+  }
+  return null;
 }
 
 function getUniqueAttrs(element) {
@@ -677,22 +1181,24 @@ function findMultipleElementsByTexts(texts) {
     if (!text || text.length < 2) continue;
     
     const truncatedText = text.substring(0, 40);
-    const allElements = document.querySelectorAll('*');
+    const allElements = findAllElementsDeep();
     
     let found = false;
-    for (const el of allElements) {
+    for (const { element, shadowPath } of allElements) {
       if (found) break;
       
-      const elText = el.textContent.trim().replace(/\s+/g, ' ');
+      const elText = element.textContent.trim().replace(/\s+/g, ' ');
       if (elText.includes(truncatedText) || (truncatedText.length > 10 && elText.substring(0, 20) === truncatedText.substring(0, 20))) {
         results.push({
           text: text.substring(0, 50),
-          path: getElementPath(el),
-          tag: el.tagName.toLowerCase(),
-          id: el.id || '',
-          className: typeof el.className === 'string' ? el.className.split(/\s+/).slice(0, 3).join(' ') : '',
-          attributes: getUniqueAttrs(el),
-          matchedText: elText.substring(0, 50)
+          path: getElementPath(element, shadowPath),
+          fullPath: buildFullPath(element, shadowPath),
+          tag: element.tagName.toLowerCase(),
+          id: element.id || '',
+          className: typeof element.className === 'string' ? element.className.split(/\s+/).slice(0, 3).join(' ') : '',
+          attributes: getUniqueAttrs(element),
+          matchedText: elText.substring(0, 50),
+          hasShadowDOM: shadowPath.length > 0
         });
         found = true;
       }
@@ -704,15 +1210,17 @@ function findMultipleElementsByTexts(texts) {
 
 function findElementsBySelector(selector) {
   try {
-    const elements = document.querySelectorAll(selector);
-    return Array.from(elements).map((el, i) => ({
+    const results = querySelectorAllDeep(selector);
+    return results.map(({ element, shadowPath }, i) => ({
       index: i,
-      tag: el.tagName.toLowerCase(),
-      id: el.id || '',
-      className: typeof el.className === 'string' ? el.className.split(/\s+/).slice(0, 3).join(' ') : '',
-      text: el.textContent.trim().substring(0, 100),
-      attributes: getUniqueAttrs(el),
-      rect: el.getBoundingClientRect()
+      tag: element.tagName.toLowerCase(),
+      id: element.id || '',
+      className: typeof element.className === 'string' ? element.className.split(/\s+/).slice(0, 3).join(' ') : '',
+      text: element.textContent.trim().substring(0, 100),
+      attributes: getUniqueAttrs(element),
+      rect: element.getBoundingClientRect ? element.getBoundingClientRect() : { top: 0, left: 0, width: 0, height: 0 },
+      hasShadowDOM: shadowPath.length > 0,
+      fullPath: buildFullPath(element, shadowPath)
     }));
   } catch (e) {
     return [];
@@ -721,21 +1229,22 @@ function findElementsBySelector(selector) {
 
 function validateSelectorOnPage(selector) {
   try {
-    const elements = document.querySelectorAll(selector);
-    if (elements.length === 0) {
+    const results = querySelectorAllDeep(selector);
+    if (results.length === 0) {
       return { valid: false, count: 0 };
     }
     
-    const samples = Array.from(elements).slice(0, 3).map(el => ({
-      tag: el.tagName.toLowerCase(),
-      text: el.textContent.trim().substring(0, 50),
-      hasText: el.textContent.trim().length > 0
+    const samples = results.slice(0, 3).map(({ element }) => ({
+      tag: element.tagName.toLowerCase(),
+      text: element.textContent.trim().substring(0, 50),
+      hasText: element.textContent.trim().length > 0
     }));
     
     return {
       valid: true,
-      count: elements.length,
-      samples: samples
+      count: results.length,
+      samples: samples,
+      hasShadowDOM: results.some(r => r.shadowPath.length > 0)
     };
   } catch (e) {
     return { valid: false, count: 0, error: e.message };
