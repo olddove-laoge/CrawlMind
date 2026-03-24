@@ -350,7 +350,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   
   // 用户确认请求
   if (request.action === 'requestUserConfirm') {
-    showUserConfirmDialog(request.data, request.requirement, sendResponse);
+    showUserConfirmDialog(request.data, request.requirement, sendResponse, request.isSelectorTest);
     return true; // 异步响应
   }
   
@@ -473,6 +473,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     
     console.log('CrawlMind: 没找到翻页按钮');
     sendResponse({ success: false, error: '按钮不存在' });
+    return true;
+  }
+  
+  // 窗口滚动（当没有滚动容器时使用）
+  if (request.action === 'windowScroll') {
+    const startY = window.scrollY;
+    const maxY = document.documentElement.scrollHeight - window.innerHeight;
+    
+    if (startY >= maxY) {
+      sendResponse({ success: false, reason: 'already_at_bottom' });
+      return true;
+    }
+    
+    // 滚动到页面底部
+    window.scrollTo({
+      top: maxY,
+      behavior: 'smooth'
+    });
+    
+    // 等待滚动完成
+    setTimeout(() => {
+      const newY = window.scrollY;
+      sendResponse({ 
+        success: newY > startY, 
+        fromY: startY, 
+        toY: newY,
+        reason: newY > startY ? 'scrolled' : 'already_at_bottom'
+      });
+    }, 2000);
+    
     return true;
   }
   
@@ -923,29 +953,57 @@ function extractByShadowPath(simplePath, shadowParts, requirement, lazyAttr = 's
 }
 
 function collectAllText(element, results) {
-  // 获取元素的文本
-  const text = element.textContent?.trim();
-  if (text) {
-    results.push(text);
-  }
-  
-  // 进入 Shadow DOM
+  // 合并相邻的纯文本节点，跳过子元素
   if (element.shadowRoot) {
-    for (const child of element.shadowRoot.children) {
-      collectAllText(child, results);
+    let combinedText = '';
+    
+    for (const node of element.shadowRoot.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        // 纯文本，累加
+        combinedText += node.textContent;
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        // 元素节点，先把累积的文本加入结果
+        const trimmed = combinedText.trim();
+        if (trimmed && trimmed.length > 2) {
+          results.push(trimmed);
+        }
+        combinedText = '';
+      }
+    }
+    
+    // 处理末尾的文本
+    const trimmed = combinedText.trim();
+    if (trimmed && trimmed.length > 2) {
+      results.push(trimmed);
+    }
+  } else {
+    // 没有 shadowRoot，直接获取文本
+    const text = element.textContent?.trim();
+    if (text && text.length > 2) {
+      results.push(text);
     }
   }
 }
 
 function collectAllTextDeep(element, results) {
-  // 获取元素的直接文本（不包括子元素）
+  // 合并相邻的纯文本节点
+  let combinedText = '';
+  
   for (const node of element.childNodes) {
     if (node.nodeType === Node.TEXT_NODE) {
-      const text = node.textContent?.trim();
-      if (text) {
-        results.push(text);
+      combinedText += node.textContent;
+    } else if (node.nodeType === Node.ELEMENT_NODE) {
+      const trimmed = combinedText.trim();
+      if (trimmed && trimmed.length > 2) {
+        results.push(trimmed);
       }
+      combinedText = '';
     }
+  }
+  
+  const trimmed = combinedText.trim();
+  if (trimmed && trimmed.length > 2) {
+    results.push(trimmed);
   }
   
   // 进入元素的 Shadow DOM
@@ -1132,13 +1190,13 @@ function buildFullPath(element, shadowPath = []) {
 function findElementByText(text, maxLength = 50) {
   if (!text || text.length < 2) return null;
   
-  const truncatedText = text.substring(0, maxLength);
-  
+  const searchText = text.substring(0, maxLength).trim();
   const allElements = findAllElementsDeep();
   
+  // 第一轮：精确匹配（完全相等）
   for (const { element, shadowPath } of allElements) {
     const elText = element.textContent.trim().replace(/\s+/g, ' ');
-    if (elText.includes(truncatedText) || truncatedText.includes(elText.substring(0, 30))) {
+    if (elText === searchText) {
       const path = getElementPath(element, shadowPath);
       const fullPath = buildFullPath(element, shadowPath);
       const uniqueAttrs = getUniqueAttrs(element);
@@ -1153,10 +1211,60 @@ function findElementByText(text, maxLength = 50) {
         attributes: uniqueAttrs,
         text: elText.substring(0, 100),
         rect: element.getBoundingClientRect ? element.getBoundingClientRect() : { top: 0, left: 0, width: 0, height: 0 },
-        hasShadowDOM: shadowPath.length > 0
+        hasShadowDOM: shadowPath.length > 0,
+        matchType: 'exact'
       };
     }
   }
+  
+  // 第二轮：文本开头匹配（以搜索文本开头）
+  for (const { element, shadowPath } of allElements) {
+    const elText = element.textContent.trim().replace(/\s+/g, ' ');
+    if (elText.startsWith(searchText) && elText.length < searchText.length + 50) {
+      const path = getElementPath(element, shadowPath);
+      const fullPath = buildFullPath(element, shadowPath);
+      const uniqueAttrs = getUniqueAttrs(element);
+      const tag = element.tagName.toLowerCase();
+      
+      return {
+        path: path,
+        fullPath: fullPath,
+        tag: tag,
+        id: element.id || '',
+        className: typeof element.className === 'string' ? element.className : '',
+        attributes: uniqueAttrs,
+        text: elText.substring(0, 100),
+        rect: element.getBoundingClientRect ? element.getBoundingClientRect() : { top: 0, left: 0, width: 0, height: 0 },
+        hasShadowDOM: shadowPath.length > 0,
+        matchType: 'prefix'
+      };
+    }
+  }
+  
+  // 第三轮：包含匹配（作为备选）
+  for (const { element, shadowPath } of allElements) {
+    const elText = element.textContent.trim().replace(/\s+/g, ' ');
+    if (elText.includes(searchText)) {
+      const path = getElementPath(element, shadowPath);
+      const fullPath = buildFullPath(element, shadowPath);
+      const uniqueAttrs = getUniqueAttrs(element);
+      const tag = element.tagName.toLowerCase();
+      
+      return {
+        path: path,
+        fullPath: fullPath,
+        tag: tag,
+        id: element.id || '',
+        className: typeof element.className === 'string' ? element.className : '',
+        attributes: uniqueAttrs,
+        text: elText.substring(0, 100),
+        rect: element.getBoundingClientRect ? element.getBoundingClientRect() : { top: 0, left: 0, width: 0, height: 0 },
+        hasShadowDOM: shadowPath.length > 0,
+        matchType: 'contains'
+      };
+    }
+  }
+  
   return null;
 }
 
@@ -1389,7 +1497,7 @@ function stopExtract() {
 }
 
 // 显示用户确认对话框
-function showUserConfirmDialog(data, requirement, sendResponse) {
+function showUserConfirmDialog(data, requirement, sendResponse, isSelectorTest = false) {
   const container = document.getElementById('crawlmind-messages');
   if (!container) {
     sendResponse({ confirmed: false });
@@ -1405,13 +1513,16 @@ function showUserConfirmDialog(data, requirement, sendResponse) {
   const existing = container.querySelector('.confirm-dialog');
   if (existing) existing.remove();
   
+  const title = isSelectorTest ? '🎯 请确认选择器提取的数据是否正确' : '📋 请确认这是您要的数据';
+  const requirementLabel = isSelectorTest ? '选择器测试' : '需求';
+  
   // 显示提取的数据预览
   const dataPreview = document.createElement('div');
   dataPreview.className = 'confirm-dialog';
   dataPreview.style.cssText = 'padding: 12px; margin: 8px 0; background: #e3f2fd; border-radius: 8px; font-size: 13px; max-height: 200px; overflow-y: auto;';
   dataPreview.innerHTML = `
-    <div style="font-weight: 600; margin-bottom: 8px;">📋 请确认这是您要的数据</div>
-    <div style="color: #666; margin-bottom: 8px;">需求: ${requirement}</div>
+    <div style="font-weight: 600; margin-bottom: 8px;">${title}</div>
+    <div style="color: #666; margin-bottom: 8px;">${requirementLabel}: ${requirement}</div>
     <div style="background: white; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-all;">${data}</div>
     <div style="margin-top: 12px; display: flex; gap: 8px; justify-content: center;">
       <button id="crawlmind-confirm-yes" style="padding: 8px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">✅ 正确</button>
@@ -1424,7 +1535,7 @@ function showUserConfirmDialog(data, requirement, sendResponse) {
   // 绑定确认按钮
   document.getElementById('crawlmind-confirm-yes').onclick = () => {
     chrome.storage.local.set({ userConfirmed: true }, () => {
-      addMessage('system', '✅ 用户确认数据正确');
+      addMessage('system', isSelectorTest ? '✅ 用户确认选择器正确' : '✅ 用户确认数据正确');
       dataPreview.remove();
       sendResponse({ confirmed: true });
     });
@@ -1433,7 +1544,7 @@ function showUserConfirmDialog(data, requirement, sendResponse) {
   // 绑定拒绝按钮
   document.getElementById('crawlmind-confirm-no').onclick = () => {
     chrome.storage.local.set({ userConfirmed: false }, () => {
-      addMessage('system', '❌ 用户拒绝该数据，将重新寻找');
+      addMessage('system', isSelectorTest ? '❌ 用户拒绝该选择器，将尝试其他方法' : '❌ 用户拒绝该数据，将重新寻找');
       dataPreview.remove();
       sendResponse({ confirmed: false });
     });

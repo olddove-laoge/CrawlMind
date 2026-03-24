@@ -721,9 +721,43 @@ ${treeText.substring(extractStart, extractStart + firstExtractSize)}
   if (!globalSelector && layerPath) {
     sendProgress('🤖 正在生成CSS选择器...');
     const htmlSegment = treeText.substring(extractStart, extractStart + firstExtractSize);
-    globalSelector = await generateSelector(layerPath, userRequirement, result, htmlSegment, sendProgress, tabId);
-    if (globalSelector) {
-      sendProgress(`✅ CSS选择器已生成: ${globalSelector}`);
+    const newSelector = await generateSelector(layerPath, userRequirement, result, htmlSegment, sendProgress, tabId);
+    
+    if (newSelector) {
+      // 用新选择器提取少量数据测试（不发送到浮窗日志）
+      const testData = await testSelector(tabId, newSelector, userRequirement, sendProgress);
+      
+      if (testData && testData.length > 0) {
+        // 只在控制台显示选择器，不发到浮窗UI
+        console.log('选择器:', newSelector);
+        
+        // 发送确认请求（数据在对话框内显示，不通过日志）
+        const confirmed = await new Promise((resolve) => {
+          chrome.tabs.sendMessage(tabId, {
+            action: 'requestUserConfirm',
+            data: testData.slice(0, 10).join('\n'),
+            requirement: `${userRequirement}\n选择器: ${newSelector}`,
+            isSelectorTest: true
+          }, (response) => {
+            resolve(response?.confirmed ?? false);
+          });
+        });
+        
+        const { userConfirmed } = await chrome.storage.local.get('userConfirmed');
+        await chrome.storage.local.set({ userConfirmed: false });
+        
+        if (userConfirmed) {
+          globalSelector = newSelector;
+          sendProgress(`✅ 用户确认选择器正确，继续提取...`);
+        } else {
+          sendProgress(`❌ 用户拒绝该选择器，尝试其他方法...`);
+          // 继续使用原来的逻辑（让LLM提取）
+          globalSelector = null;
+        }
+      } else {
+        sendProgress(`⚠️ 选择器未提取到数据，使用层级路径: ${layerPath}`);
+        globalSelector = layerPath;
+      }
     }
   }
   
@@ -837,11 +871,20 @@ async function getMoreResultsByLayer(treeText, userRequirement, layerPath, forma
         sendProgress(`📜 持续滚动加载更多...`);
         const scrollResult = await smoothScrollContainer(tabId, 0, sendProgress);
         if (scrollResult?.success) {
-          sendProgress(`📜 滚动完成，等待图片加载...`);
+          sendProgress(`📜 滚动完成，等待加载...`);
           await new Promise(r => setTimeout(r, 3000));
         }
       } else {
-        break;
+        // 检测不到滚动容器时，尝试窗口滚动
+        sendProgress(`📜 检测不到滚动容器，尝试窗口滚动...`);
+        const windowScrollResult = await chrome.tabs.sendMessage(tabId, { action: 'windowScroll' });
+        if (windowScrollResult?.success) {
+          sendProgress(`📜 窗口滚动完成，等待加载...`);
+          await new Promise(r => setTimeout(r, 3000));
+        } else {
+          sendProgress(`⚠️ 无法滚动，尝试翻页...`);
+          // 继续尝试翻页，不直接退出
+        }
       }
     }
     
@@ -1397,6 +1440,12 @@ async function generateSelector(layerPath, userRequirement, extractedData, htmlS
   }
   
   if (elementPaths.length === 0) {
+    // DOM定位失败，使用层级路径作为候选
+    if (layerPath) {
+      sendProgress(`⚠️ DOM定位失败，使用层级路径: ${layerPath}`);
+      // 直接返回层级路径作为选择器
+      return layerPath;
+    }
     sendProgress(`⚠️ DOM定位失败，回退到LLM分析`);
     return await generateSelectorByLLM(layerPath, userRequirement, extractedData, htmlSegment, sendProgress);
   }
@@ -1406,6 +1455,11 @@ async function generateSelector(layerPath, userRequirement, extractedData, htmlS
   
   const candidates = [];
   const isImage = userRequirement.includes('图片') || userRequirement.includes('img') || userRequirement.includes('photo');
+  
+  // 策略0：层级路径（优先使用，因为它是我们已验证过的正确路径）
+  if (layerPath) {
+    candidates.push({ selector: layerPath, type: 'layer-path', count: elementPaths.length, priority: 0 });
+  }
   
   // 策略1：ID选择器
   const ids = elementPaths.filter(e => e.id).map(e => `#${e.id}`);
@@ -1559,8 +1613,13 @@ async function generateSelector(layerPath, userRequirement, extractedData, htmlS
       return b.selector.length - a.selector.length;
     });
   } else {
-    // 非图片：按准确度优先
+    // 非图片：优先层级路径，然后按准确度
     validatedCandidates.sort((a, b) => {
+      // 优先选择层级路径（priority = 0）
+      const aPriority = a.priority !== undefined ? a.priority : 1;
+      const bPriority = b.priority !== undefined ? b.priority : 1;
+      if (aPriority !== bPriority) return aPriority - bPriority;
+      
       if (b.accuracy !== a.accuracy) return b.accuracy - a.accuracy;
       if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount;
       return b.count - a.count;
@@ -1765,6 +1824,46 @@ function sendMessageToContent(tabId, message) {
       resolve(response);
     });
   });
+}
+
+// 测试选择器能提取什么数据
+async function testSelector(tabId, selector, requirement, sendProgress) {
+  const pathInfo = parseShadowPath(selector);
+  
+  try {
+    let response;
+    
+    if (pathInfo.hasShadowDOM) {
+      response = await new Promise((resolve) => {
+        chrome.tabs.sendMessage(tabId, {
+          action: 'extractByShadowPath',
+          simplePath: pathInfo.simplePath,
+          shadowParts: pathInfo.shadowParts,
+          requirement: requirement,
+          lazyAttr: 'src',
+          filterPatterns: []
+        }, resolve);
+      });
+    } else {
+      response = await new Promise((resolve) => {
+        chrome.tabs.sendMessage(tabId, {
+          action: 'extractBySelector',
+          selector: selector,
+          requirement: requirement,
+          lazyAttr: 'src',
+          filterPatterns: []
+        }, resolve);
+      });
+    }
+    
+    if (response && response.data) {
+      return response.data;
+    }
+  } catch (e) {
+    sendProgress(`⚠️ 测试选择器失败: ${e.message}`);
+  }
+  
+  return null;
 }
 
 // 解析 Shadow DOM 路径（如 "bili-comments >> #feed > bili-comment"）
