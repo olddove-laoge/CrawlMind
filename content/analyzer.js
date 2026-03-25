@@ -354,6 +354,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // 异步响应
   }
   
+  // 询问是否保存选择器
+  if (request.action === 'askSaveSelector') {
+    showSaveSelectorDialog(request.selector, request.requirement, sendResponse);
+    return true; // 异步响应
+  }
+  
   // 滚动容器检测
   if (request.action === 'findScrollable') {
     const containers = findScrollableContainers();
@@ -1547,6 +1553,58 @@ function showUserConfirmDialog(data, requirement, sendResponse, isSelectorTest =
       addMessage('system', isSelectorTest ? '❌ 用户拒绝该选择器，将尝试其他方法' : '❌ 用户拒绝该数据，将重新寻找');
       dataPreview.remove();
       sendResponse({ confirmed: false });
+    });
+  };
+}
+
+// 显示保存选择器确认对话框
+function showSaveSelectorDialog(selector, requirement, sendResponse) {
+  const container = document.getElementById('crawlmind-messages');
+  if (!container) {
+    sendResponse({ save: false });
+    return;
+  }
+  
+  // 确保面板打开
+  if (!isPanelOpen) {
+    togglePanel();
+  }
+  
+  // 移除已有的确认对话框
+  const existing = container.querySelector('.save-selector-dialog');
+  if (existing) existing.remove();
+  
+  const dialog = document.createElement('div');
+  dialog.className = 'save-selector-dialog';
+  dialog.style.cssText = 'padding: 12px; margin: 8px 0; background: #e8f5e9; border-radius: 8px; font-size: 13px;';
+  dialog.innerHTML = `
+    <div style="font-weight: 600; margin-bottom: 8px;">💾 保存选择器</div>
+    <div style="color: #666; margin-bottom: 8px;">需求: ${requirement}</div>
+    <div style="background: white; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 11px; word-break: break-all; margin-bottom: 8px;">${selector}</div>
+    <div style="color: #666; font-size: 12px; margin-bottom: 12px;">下次爬取相同类型数据时可直接使用此选择器</div>
+    <div style="display: flex; gap: 8px; justify-content: center;">
+      <button id="crawlmind-save-selector-yes" style="padding: 8px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">✅ 保存</button>
+      <button id="crawlmind-save-selector-no" style="padding: 8px 20px; background: #9e9e9e; color: white; border: none; border-radius: 4px; cursor: pointer;">❌ 不保存</button>
+    </div>
+  `;
+  container.appendChild(dialog);
+  container.scrollTop = container.scrollHeight;
+  
+  // 绑定保存按钮
+  document.getElementById('crawlmind-save-selector-yes').onclick = () => {
+    chrome.storage.local.set({ saveSelectorChoice: true }, () => {
+      addMessage('system', '✅ 选择器已保存');
+      dialog.remove();
+      sendResponse({ save: true });
+    });
+  };
+  
+  // 绑定不保存按钮
+  document.getElementById('crawlmind-save-selector-no').onclick = () => {
+    chrome.storage.local.set({ saveSelectorChoice: false }, () => {
+      addMessage('system', 'ℹ️ 选择器未保存');
+      dialog.remove();
+      sendResponse({ save: false });
     });
   };
 }

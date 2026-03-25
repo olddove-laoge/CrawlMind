@@ -238,6 +238,181 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
       });
     };
     
+    // ====== 第零步：尝试查找已有的选择器 ======
+    let savedSelector = null;
+    let usedSavedSelector = false;
+    
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const url = new URL(tab.url);
+      const domain = url.hostname;
+      
+      sendProgressToPage(`🔍 查找已有选择器 (${domain})...`);
+      
+      savedSelector = await findMatchingSelector(domain, userRequirement);
+      
+      if (savedSelector) {
+        sendProgressToPage(`📋 找到已保存选择器: ${savedSelector.title}`);
+        
+        // 先设置懒加载属性和过滤模式
+        globalLazyAttr = savedSelector.lazyAttr || 'src';
+        globalFilterPatterns = savedSelector.filterPatterns || [];
+        sendProgressToPage(`📋 使用保存的配置: lazyAttr=${globalLazyAttr}, filterPatterns=${globalFilterPatterns.join(', ')}`);
+        
+        // 验证选择器是否有效
+        const validation = await validateSelector(tabId, savedSelector.selector, userRequirement, sendProgressToPage);
+        
+        if (validation.valid && validation.data && validation.data.length > 0) {
+          // 选择器有效，直接使用
+          globalSelector = savedSelector.selector;
+          globalLazyAttr = savedSelector.lazyAttr || 'src';
+          globalFilterPatterns = savedSelector.filterPatterns || [];
+          usedSavedSelector = true;
+          
+          sendProgressToPage(`✅ 使用已保存选择器，提取到 ${validation.data.length} 条数据`);
+          
+          // 标记需要用户确认
+          await new Promise((resolve) => {
+            chrome.tabs.sendMessage(tabId, { 
+              action: 'requestUserConfirm', 
+              data: validation.data.slice(0, 10).join('\n'),
+              requirement: userRequirement,
+              isSavedSelector: true
+            }, (response) => {
+              resolve(response?.confirmed ?? false);
+            });
+          });
+          
+          const { userConfirmed } = await chrome.storage.local.get('userConfirmed');
+          await chrome.storage.local.set({ userConfirmed: false });
+          
+          if (userConfirmed) {
+            sendProgressToPage(`✅ 用户确认数据正确`);
+            
+            // 更新成功次数
+            await updateSelectorStats(savedSelector.domain, savedSelector.requirement, true);
+            
+            // 先检测滚动容器和翻页按钮
+            sendProgressToPage('🔍 检测滚动容器和翻页按钮...');
+            const { scrollContainers, paginationButtons } = await detectScrollAndPagination(tabId, sendProgressToPage);
+            globalScrollContainers = scrollContainers;
+            globalPaginationButtons = paginationButtons;
+            
+            // 直接使用选择器提取更多数据（跳过重新分析）
+            sendProgressToPage('📥 使用已保存选择器继续提取更多数据...');
+            
+            const formatLabel = savedSelector.requirement.replace(/[^a-zA-Z]/g, '') || '数据';
+            let allData = '';
+            let totalCount = validation.data.length;
+            
+            // 先把已验证的数据加入
+            const startIndex = 1;
+            const formattedData = validation.data.map((d, i) => `${formatLabel}${startIndex + i}: ${d}`).join('\n');
+            allData = formattedData;
+            
+            // 循环提取更多数据
+            while (true) {
+              // 检查停止信号
+              const { stopExtract } = await chrome.storage.local.get('stopExtract');
+              if (stopExtract) {
+                sendProgressToPage('⏹ 用户中断提取');
+                await chrome.storage.local.set({ stopExtract: false });
+                break;
+              }
+              
+              // 尝试滚动或翻页
+              let foundNewData = false;
+              
+              // 1. 尝试滚动
+              if (globalScrollContainers && globalScrollContainers.length > 0) {
+                sendProgressToPage(`📜 持续滚动加载更多...`);
+                const scrollResult = await smoothScrollContainer(tabId, 0, sendProgressToPage);
+                if (scrollResult?.success) {
+                  sendProgressToPage(`📜 滚动完成，等待加载...`);
+                  await new Promise(r => setTimeout(r, 3000));
+                  
+                  const newData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgressToPage);
+                  if (newData && newData.length > 0) {
+                    // 去重
+                    const uniqueData = [];
+                    for (const item of newData) {
+                      const trimmed = item.trim().toLowerCase();
+                      if (!globalExtractedData.has(trimmed)) {
+                        globalExtractedData.add(trimmed);
+                        uniqueData.push(item.trim());
+                      }
+                    }
+                    if (uniqueData.length > 0) {
+                      totalCount += uniqueData.length;
+                      const nextIndex = totalCount - uniqueData.length + 1;
+                      const formatted = uniqueData.map((d, i) => `${formatLabel}${nextIndex + i}: ${d}`).join('\n');
+                      allData += '\n' + formatted;
+                      sendProgressToPage(`🔍 本次提取 ${uniqueData.length} 条数据，累计 ${totalCount} 条`);
+                      foundNewData = true;
+                    }
+                  }
+                }
+              }
+              
+              // 2. 尝试翻页
+              if (!foundNewData && globalPaginationButtons && globalPaginationButtons.length > 0) {
+                for (const btn of globalPaginationButtons) {
+                  const clickResult = await chrome.tabs.sendMessage(tabId, { action: 'doClickPagination', text: btn.text });
+                  if (clickResult?.success) {
+                    sendProgressToPage(`🔄 已点击翻页按钮，等待加载...`);
+                    await new Promise(r => setTimeout(r, 3000));
+                    
+                    const newData = await extractBySelector(tabId, userRequirement, formatLabel, sendProgressToPage);
+                    if (newData && newData.length > 0) {
+                      const uniqueData = [];
+                      for (const item of newData) {
+                        const trimmed = item.trim().toLowerCase();
+                        if (!globalExtractedData.has(trimmed)) {
+                          globalExtractedData.add(trimmed);
+                          uniqueData.push(item.trim());
+                        }
+                      }
+                      if (uniqueData.length > 0) {
+                        totalCount += uniqueData.length;
+                        const nextIndex = totalCount - uniqueData.length + 1;
+                        const formatted = uniqueData.map((d, i) => `${formatLabel}${nextIndex + i}: ${d}`).join('\n');
+                        allData += '\n' + formatted;
+                        sendProgressToPage(`🔍 翻页提取 ${uniqueData.length} 条数据，累计 ${totalCount} 条`);
+                        foundNewData = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+              
+              if (!foundNewData) {
+                sendProgressToPage('✅ 已获取所有数据（滚动和翻页均无新数据）');
+                break;
+              }
+            }
+            
+            sendProgressToPage(`✅ 提取完成，共 ${totalCount} 条数据`);
+            return allData;
+          } else {
+            // 用户拒绝，回退到正常分析
+            sendProgressToPage(`❌ 用户拒绝，回退到正常分析流程`);
+            usedSavedSelector = false;
+            globalSelector = '';
+          }
+        } else {
+          // 选择器失效
+          sendProgressToPage(`⚠️ 已保存选择器失效，回退到正常分析`);
+          await updateSelectorStats(savedSelector.domain, savedSelector.requirement, false);
+          savedSelector = null;
+        }
+      } else {
+        sendProgressToPage('ℹ️ 未找到已保存选择器');
+      }
+    } catch (e) {
+      console.log('查找选择器出错:', e.message);
+    }
+    
     // ====== 第一步：检测滚动容器和翻页按钮 ======
     sendProgressToPage('🔍 正在检测滚动容器和翻页按钮...');
     const { scrollContainers, paginationButtons } = await detectScrollAndPagination(tabId, sendProgressToPage);
@@ -269,8 +444,10 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
 
 重要提示：
 1. HTML中的 <#shadow-root> 是 Shadow DOM 的占位符标记，表示进入 Web Component 的 Shadow DOM
-2. Shadow DOM 路径格式：使用 " >> " 分隔不同 Shadow DOM 层级的选择器
-3. 例如：bili-comments >> #feed > bili-comment-thread-renderer >> #comment 表示：
+2. ⚠️ 只有当HTML框架中真正存在 <#shadow-root> 标记时，才使用 >> 表示Shadow DOM路径
+3. ⚠️ 如果HTML中没有 <#shadow-root> 标记，请使用普通选择器（如 > 或空格），不要猜测或假设元素在Shadow DOM中
+4. Shadow DOM 路径格式：使用 " >> " 分隔不同 Shadow DOM 层级的选择器
+5. 例如：bili-comments >> #feed > bili-comment-thread-renderer >> #comment 表示：
    - 先选择 bili-comments
    - 进入其 shadowRoot，查找 #feed
    - 进入 #feed 的 shadowRoot，查找 bili-comment-thread-renderer
@@ -278,10 +455,10 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
 
 请严格按照以下格式输出：
 ---分析开始---
-[在这里详细描述你观察到的HTML结构，特别是哪些标签、class、id可能包含目标数据。注意 <#shadow-root> 表示 Shadow DOM 边界]
+[在这里详细描述你观察到的HTML结构，特别是哪些标签、class、id可能包含目标数据。只有当HTML中存在 <#shadow-root> 标记时才考虑使用 >> 路径]
 
 ---层级判断---
-{"层级路径": "使用 >> 表示 Shadow DOM 边界，如 bili-comments >> #feed 或 div#commentapp > bili-comments >> #contents", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false, "当前深度": 数字, "理由": "为什么选择这个层级"}` },
+{"层级路径": "只有当HTML中存在 <#shadow-root> 时才使用 >>，如 bili-comments >> #feed，否则使用普通选择器如 div#commentapp > .content", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false, "当前深度": 数字, "理由": "为什么选择这个层级"}` },
       { role: 'user', content: `用户需求：${userRequirement}\n\nHTML结构（完整框架，不含文本内容，共${fullFramework.length}字符）：\n${fullFramework}` }
     ];
     
@@ -348,7 +525,7 @@ async function analyzeWithStrategy(treeText, userRequirement, tabId, sendProgres
       let segment = fullContent.substring(offset, offset + 20000);
       if (!segment) break;
       
-      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}，当前偏移${offset}）：\n${segment}\n\n重要：<#shadow-root> 是 Shadow DOM 边界标记，路径中使用 " >> " 表示进入 Shadow DOM。\n例如：bili-comments >> #feed > bili-comment-renderer\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察是否包含用户需要的数据（可能是文本、链接、图片、价格、评论、标题、音频、视频、文件等任何内容）]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "使用 >> 表示 Shadow DOM，如 bili-comments >> #comment", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
+      messages[1].content = `用户需求：${userRequirement}\n\nHTML层级结构（深度${currentDepth + 1}，当前偏移${offset}）：\n${segment}\n\n⚠️ 重要提示：只有当HTML中真正存在 <#shadow-root> 标记时，才使用 >> 表示Shadow DOM路径。如果HTML中没有该标记，请使用普通选择器（> 或空格），不要猜测元素在Shadow DOM中。\n\n请严格按照格式输出：\n---分析开始---\n[详细描述这个层级的结构，观察是否包含用户需要的数据（可能是文本、链接、图片、价格、评论、标题、音频、视频、文件等任何内容）]\n\n---判断结果---\n{"是否找到": true/false, "层级路径": "使用 >> 表示 Shadow DOM，如 bili-comments >> #comment", "包含的属性": "如 id='xxx'", "理由": "为什么选择"}`;
       
       sendProgressToPage(`🤖 LLM正在分析深度${currentDepth + 1}...`);
       sendProgressToPage(`💭 思考中: 检查深度${currentDepth + 1}是否包含目标数据...`);
@@ -749,6 +926,27 @@ ${treeText.substring(extractStart, extractStart + firstExtractSize)}
         if (userConfirmed) {
           globalSelector = newSelector;
           sendProgress(`✅ 用户确认选择器正确，继续提取...`);
+          
+          // 询问是否保存选择器
+          sendProgress(`💾 询问是否保存选择器...`);
+          await new Promise((resolve) => {
+            chrome.tabs.sendMessage(tabId, {
+              action: 'askSaveSelector',
+              selector: newSelector,
+              requirement: userRequirement
+            }, (response) => {
+              resolve(response?.save ?? false);
+            });
+          });
+          
+          const { saveSelectorChoice } = await chrome.storage.local.get('saveSelectorChoice');
+          await chrome.storage.local.set({ saveSelectorChoice: false });
+          
+          if (saveSelectorChoice) {
+            await saveSelectorToFile(tabId, newSelector, userRequirement, sendProgress);
+          } else {
+            sendProgress(`ℹ️ 用户选择不保存选择器`);
+          }
         } else {
           sendProgress(`❌ 用户拒绝该选择器，尝试其他方法...`);
           // 继续使用原来的逻辑（让LLM提取）
@@ -1349,15 +1547,15 @@ async function detectLayerPath(treeText, userRequirement, sendProgress) {
 
 重要：
 1. <#shadow-root> 是 Shadow DOM 的占位符标记
-2. 路径中使用 " >> " 分隔不同 Shadow DOM 层级
-3. 例如：bili-comments >> #feed 表示进入 bili-comments 的 shadowRoot 查找 #feed
+2. ⚠️ 只有当HTML中真正存在 <#shadow-root> 标记时，才使用 >> 表示Shadow DOM路径
+3. ⚠️ 如果HTML中没有 <#shadow-root> 标记，请使用普通选择器（如 > 或空格），不要猜测元素在Shadow DOM中
 
 请严格按照以下格式输出：
 ---分析开始---
 [详细描述你观察到的HTML结构，特别是哪些标签、class、id可能包含目标数据]
 
 ---层级判断---
-{"层级路径": "使用 >> 表示 Shadow DOM 边界，如 bili-comments >> #feed > bili-comment-renderer", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false}` },
+{"层级路径": "只有当HTML中存在 <#shadow-root> 时才使用 >>，如 bili-comments >> #feed，否则使用普通选择器", "包含的属性": "如 class='product-item' id='item-1'", "是否找到": true/false}` },
     { role: 'user', content: `用户需求：${userRequirement}\n\nHTML结构（前${segment.length}字符）：\n${segment}` }
   ];
   
@@ -1937,4 +2135,268 @@ async function extractBySelector(tabId, userRequirement, formatLabel, sendProgre
       }
     });
   });
+}
+
+// ==================== 选择器持久化功能 ====================
+
+const SELECTORS_FILE = 'data/selectors.json';
+
+// 加载选择器数据
+async function loadSelectors() {
+  // 优先从 storage 加载（运行时使用）
+  const result = await chrome.storage.local.get('selectorsData');
+  if (result.selectorsData && result.selectorsData.length > 0) {
+    console.log('从storage加载选择器:', result.selectorsData.length, '条');
+    return result.selectorsData;
+  }
+  
+  // 回退：尝试从文件加载
+  try {
+    const response = await fetch(chrome.runtime.getURL(SELECTORS_FILE));
+    if (response.ok) {
+      const data = await response.json();
+      return data.selectors || [];
+    }
+  } catch (e) {
+    console.log('加载选择器文件失败:', e.message);
+  }
+  return [];
+}
+
+// 保存选择器数据
+async function saveSelectorsToFile(selectors) {
+  console.log('保存选择器到文件:', selectors.length, '条');
+}
+
+// 查找匹配的选择器
+async function findMatchingSelector(domain, userRequirement) {
+  const selectors = await loadSelectors();
+  
+  if (selectors.length === 0) {
+    console.log('没有已保存的选择器');
+    return null;
+  }
+  
+  console.log('当前域名:', domain, '需求:', userRequirement);
+  console.log('已保存选择器:', selectors.map(s => ({ domain: s.domain, requirement: s.requirement })));
+  
+  // 提取需求关键词
+  const requirementKeywords = extractKeywords(userRequirement);
+  console.log('需求关键词:', requirementKeywords);
+  
+  // 匹配查找
+  for (const sel of selectors) {
+    // 域名匹配检查 - 提取根域名进行比较
+    const rootDomain1 = getRootDomain(domain);
+    const rootDomain2 = getRootDomain(sel.domain);
+    const domainMatch = rootDomain1 === rootDomain2;
+    
+    console.log('域名匹配检查:', domain, 'vs', sel.domain, '→', rootDomain1, '===', rootDomain2, '=', domainMatch);
+    
+    if (!domainMatch) continue;
+    
+    // 需求关键词匹配
+    const reqMatch = requirementKeywords.some(kw => 
+      sel.requirement.includes(kw) || kw.includes(sel.requirement)
+    );
+    if (!reqMatch) continue;
+    
+    console.log('找到匹配选择器:', sel.title, sel.selector);
+    return sel;
+  }
+  
+  return null;
+}
+
+// 提取根域名
+function getRootDomain(hostname) {
+  const parts = hostname.split('.');
+  if (parts.length >= 2) {
+    // 处理特殊域名如 .com.cn
+    if (parts.length >= 3 && ['com', 'gov', 'edu', 'org', 'net'].includes(parts[parts.length - 2])) {
+      return parts.slice(-3).join('.');
+    }
+    return parts.slice(-2).join('.');
+  }
+  return hostname;
+}
+
+// 提取需求关键词
+function extractKeywords(requirement) {
+  const keywords = [];
+  const lower = requirement.toLowerCase();
+  
+  const patterns = [
+    '评论', '评论内容', '视频评论', '评论区',
+    '商品', '商品名称', '商品标题', '商品价格',
+    '图片', '图片链接', '商品图片',
+    '标题', '文章标题',
+    '内容', '文本',
+    '链接', 'href',
+    '价格', '价钱',
+    '作者', 'up主', '发布者'
+  ];
+  
+  for (const p of patterns) {
+    if (lower.includes(p)) {
+      keywords.push(p);
+    }
+  }
+  
+  // 如果没匹配到，用原始需求
+  if (keywords.length === 0 && requirement.length > 0) {
+    keywords.push(requirement);
+  }
+  
+  return keywords;
+}
+
+// LLM 生成 title
+async function generateTitle(domain, url, requirement) {
+  const messages = [
+    { role: 'system', content: `你是一个标题生成专家。根据域名和用户需求，生成一个简洁的标题。
+    
+要求：
+1. 格式：域名 + 需求类型 + 选择器
+2. 示例：
+   - bilibili.com + 评论 → "bilibili视频评论选择器"
+   - jd.com + 商品价格 → "京东商品价格选择器"
+   - taobao.com + 商品图片 → "淘宝商品图片选择器"
+
+只输出标题，不要其他内容。` },
+    { role: 'user', content: `域名: ${domain}\nURL: ${url}\n需求: ${requirement}\n\n请生成标题。` }
+  ];
+  
+  try {
+    const title = await callLLM(messages);
+    return title.trim();
+  } catch (e) {
+    // 回退到简单生成
+    return `${domain}${requirement}选择器`;
+  }
+}
+
+// 验证选择器是否有效
+async function validateSelector(tabId, selector, userRequirement, sendProgress) {
+  sendProgress(`🔍 验证选择器: ${selector}`);
+  
+  const pathInfo = parseShadowPath(selector);
+  let response;
+  
+  if (pathInfo.hasShadowDOM) {
+    response = await sendMessageToContent(tabId, {
+      action: 'extractByShadowPath',
+      simplePath: pathInfo.simplePath,
+      shadowParts: pathInfo.shadowParts,
+      requirement: userRequirement,
+      lazyAttr: globalLazyAttr,
+      filterPatterns: globalFilterPatterns
+    });
+  } else {
+    response = await sendMessageToContent(tabId, {
+      action: 'extractBySelector',
+      selector: selector,
+      requirement: userRequirement,
+      lazyAttr: globalLazyAttr,
+      filterPatterns: globalFilterPatterns
+    });
+  }
+  
+  if (response && response.data && response.data.length > 0) {
+    sendProgress(`✅ 选择器验证通过，提取到 ${response.data.length} 条数据`);
+    return { valid: true, data: response.data };
+  }
+  
+  sendProgress(`⚠️ 选择器验证失败，无数据`);
+  return { valid: false, data: null };
+}
+
+// 保存选择器到文件
+async function saveSelectorToFile(tabId, selector, userRequirement, sendProgress) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const url = tab.url;
+    const urlObj = new URL(url);
+    const domain = urlObj.hostname;
+    
+    // 生成 title
+    const title = await generateTitle(domain, url, userRequirement);
+    
+    // 构建选择器记录
+    const selectorRecord = {
+      title: title,
+      domain: domain,
+      requirement: userRequirement,
+      selector: selector,
+      lazyAttr: globalLazyAttr,
+      filterPatterns: globalFilterPatterns,
+      createdAt: new Date().toISOString(),
+      lastUsed: new Date().toISOString(),
+      successCount: 1,
+      failCount: 0
+    };
+    
+    // 加载现有数据
+    const selectors = await loadSelectors();
+    
+    // 检查是否已存在相同的选择器
+    const existingIndex = selectors.findIndex(s => 
+      s.domain === domain && s.requirement === userRequirement
+    );
+    
+    if (existingIndex >= 0) {
+      // 更新现有记录
+      selectors[existingIndex] = {
+        ...selectors[existingIndex],
+        selector: selector,
+        lazyAttr: globalLazyAttr,
+        filterPatterns: globalFilterPatterns,
+        lastUsed: new Date().toISOString(),
+        successCount: selectors[existingIndex].successCount + 1
+      };
+      sendProgress(`📝 更新已有选择器: ${title}`);
+    } else {
+      // 新增记录
+      selectors.push(selectorRecord);
+      sendProgress(`💾 保存新选择器: ${title}`);
+    }
+    
+    // 保存到文件（通过消息传递到 popup 保存，或者直接使用 storage）
+    // 这里使用 chrome.storage.local 模拟持久化
+    await chrome.storage.local.set({ selectorsData: selectors });
+    await chrome.storage.local.set({ selectorsSaved: true });
+    
+    sendProgress(`✅ 选择器已保存，下次相同网站可直接使用`);
+    
+    return true;
+  } catch (e) {
+    sendProgress(`⚠️ 保存选择器失败: ${e.message}`);
+    return false;
+  }
+}
+
+// 从 storage 加载选择器（运行时使用）
+async function loadSelectorsFromStorage() {
+  const result = await chrome.storage.local.get('selectorsData');
+  return result.selectorsData || [];
+}
+
+// 更新选择器成功/失败次数
+async function updateSelectorStats(domain, requirement, success) {
+  const selectors = await loadSelectorsFromStorage();
+  
+  const index = selectors.findIndex(s => 
+    s.domain === domain && s.requirement === requirement
+  );
+  
+  if (index >= 0) {
+    if (success) {
+      selectors[index].successCount = (selectors[index].successCount || 0) + 1;
+    } else {
+      selectors[index].failCount = (selectors[index].failCount || 0) + 1;
+    }
+    selectors[index].lastUsed = new Date().toISOString();
+    
+    await chrome.storage.local.set({ selectorsData: selectors });
+  }
 }
