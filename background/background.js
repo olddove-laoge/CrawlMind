@@ -2180,43 +2180,65 @@ async function findMatchingSelector(domain, userRequirement) {
   console.log('当前域名:', domain, '需求:', userRequirement);
   console.log('已保存选择器:', selectors.map(s => ({ domain: s.domain, requirement: s.requirement })));
   
-  // 提取需求关键词
-  const requirementKeywords = extractKeywords(userRequirement);
-  console.log('需求关键词:', requirementKeywords);
-  
-  // 匹配查找
-  for (const sel of selectors) {
-    // 域名匹配检查 - 提取根域名进行比较
-    const rootDomain1 = getRootDomain(domain);
+  // 先找出所有域名匹配的选择器
+  const rootDomain1 = getRootDomain(domain);
+  const domainMatchedSelectors = selectors.filter(sel => {
     const rootDomain2 = getRootDomain(sel.domain);
-    const domainMatch = rootDomain1 === rootDomain2;
-    
-    console.log('域名匹配检查:', domain, 'vs', sel.domain, '→', rootDomain1, '===', rootDomain2, '=', domainMatch);
-    
-    if (!domainMatch) continue;
-    
-    // 需求关键词匹配 - 更精确的匹配
-    // 1. 用户需求关键词必须完全匹配保存的需求（不允许包含关系）
-    // 2. 保存的需求必须包含在用户需求中
-    const userReq = userRequirement.toLowerCase();
-    const savedReq = sel.requirement.toLowerCase();
-    
-    const reqMatch = requirementKeywords.some(kw => {
-      const kwLower = kw.toLowerCase();
-      // 完全相等，或者保存的需求完全包含用户关键词（不允许反向包含）
-      return kwLower === savedReq || (savedReq.includes(kwLower) && kwLower.length >= 2);
-    });
-    
-    // 如果没有关键词匹配，尝试直接匹配完整需求
-    const exactMatch = userReq.includes(savedReq) || savedReq.includes(userReq);
-    
-    if (!reqMatch && !exactMatch) continue;
-    
-    console.log('找到匹配选择器:', sel.title, sel.selector);
-    return sel;
+    return rootDomain1 === rootDomain2;
+  });
+  
+  if (domainMatchedSelectors.length === 0) {
+    console.log('没有域名匹配的选择器');
+    return null;
   }
   
-  return null;
+  console.log('域名匹配的选择器:', domainMatchedSelectors.map(s => s.requirement));
+  
+  // 如果只有一个，直接返回
+  if (domainMatchedSelectors.length === 1) {
+    console.log('只有一个匹配，选择器:', domainMatchedSelectors[0].title);
+    return domainMatchedSelectors[0];
+  }
+  
+  // 多个选择器，让 LLM 判断最合适的
+  console.log('多个选择器，让LLM判断...');
+  
+  const selectorOptions = domainMatchedSelectors.map((sel, i) => {
+    return `[${i}] ${sel.requirement} - 选择器: ${sel.selector}`;
+  }).join('\n');
+  
+  const messages = [
+    { role: 'system', content: `你是一个选择器匹配专家。根据用户需求，从多个已保存的选择器中选择最合适的一个。
+
+要求：
+1. 分析用户需求和每个选择器保存时的需求
+2. 选择最匹配用户当前需求的选择器
+3. 只返回选择器的索引编号（如：0 或 1）
+4. 如果都不匹配，返回 -1` },
+    { role: 'user', content: `用户当前需求: ${userRequirement}
+
+已保存的选择器列表：
+${selectorOptions}
+
+请选择最合适的，选择器索引（只输出数字）：` }
+  ];
+  
+  try {
+    const llmResult = await callLLM(messages);
+    const matchIndex = parseInt(llmResult.trim());
+    
+    if (!isNaN(matchIndex) && matchIndex >= 0 && matchIndex < domainMatchedSelectors.length) {
+      const selected = domainMatchedSelectors[matchIndex];
+      console.log('LLM选择:', selected.title);
+      return selected;
+    }
+  } catch (e) {
+    console.log('LLM选择失败:', e.message);
+  }
+  
+  // LLM 选择失败，返回第一个
+  console.log('返回第一个选择器');
+  return domainMatchedSelectors[0];
 }
 
 // 提取根域名
