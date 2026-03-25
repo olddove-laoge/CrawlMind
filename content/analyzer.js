@@ -1618,15 +1618,24 @@ function showExportButtons(resultText) {
   const existing = container.querySelector('.export-buttons');
   if (existing) existing.remove();
   
-  // 解析数据
-  const lines = resultText.split('\n').filter(l => l.trim().startsWith('数据'));
-  const dataItems = lines.map(line => {
-    const match = line.match(/^数据(\d+):\s*(.+)$/);
+  // 自动识别数据类型标签（如"商品"、"图片"、"链接"等）
+  const allLines = resultText.split('\n');
+  let label = '数据';  // 默认
+  const dataItems = [];
+  
+  for (const line of allLines) {
+    const trimmed = line.trim();
+    // 匹配 "标签+数字: 内容" 的格式
+    const match = trimmed.match(/^([^\d]+)(\d+):\s*(.+)$/);
     if (match) {
-      return { index: parseInt(match[1]), value: match[2] };
+      if (label === '数据') {
+        label = match[1];  // 第一个匹配的标签作为数据类型
+      }
+      if (match[1] === label) {
+        dataItems.push({ index: parseInt(match[2]), value: match[3] });
+      }
     }
-    return null;
-  }).filter(d => d !== null);
+  }
   
   if (dataItems.length === 0) return;
   
@@ -1742,8 +1751,8 @@ function sendMessage() {
     const resultText = response.result || '分析完成';
     addMessage('system', resultText);
     
-    // 如果有数据，显示导出按钮
-    if (resultText && resultText.includes('数据')) {
+    // 爬取结束后显示导出按钮
+    if (resultText && resultText.includes(':')) {
       showExportButtons(resultText);
     }
   };
