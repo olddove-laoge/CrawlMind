@@ -2195,11 +2195,22 @@ async function findMatchingSelector(domain, userRequirement) {
     
     if (!domainMatch) continue;
     
-    // 需求关键词匹配
-    const reqMatch = requirementKeywords.some(kw => 
-      sel.requirement.includes(kw) || kw.includes(sel.requirement)
-    );
-    if (!reqMatch) continue;
+    // 需求关键词匹配 - 更精确的匹配
+    // 1. 用户需求关键词必须完全匹配保存的需求（不允许包含关系）
+    // 2. 保存的需求必须包含在用户需求中
+    const userReq = userRequirement.toLowerCase();
+    const savedReq = sel.requirement.toLowerCase();
+    
+    const reqMatch = requirementKeywords.some(kw => {
+      const kwLower = kw.toLowerCase();
+      // 完全相等，或者保存的需求完全包含用户关键词（不允许反向包含）
+      return kwLower === savedReq || (savedReq.includes(kwLower) && kwLower.length >= 2);
+    });
+    
+    // 如果没有关键词匹配，尝试直接匹配完整需求
+    const exactMatch = userReq.includes(savedReq) || savedReq.includes(userReq);
+    
+    if (!reqMatch && !exactMatch) continue;
     
     console.log('找到匹配选择器:', sel.title, sel.selector);
     return sel;
@@ -2228,8 +2239,8 @@ function extractKeywords(requirement) {
   
   const patterns = [
     '评论', '评论内容', '视频评论', '评论区',
-    '商品', '商品名称', '商品标题', '商品价格',
-    '图片', '图片链接', '商品图片',
+    '商品名称', '商品标题', '商品价格', '商品图片', '商品',
+    '图片', '图片链接',
     '标题', '文章标题',
     '内容', '文本',
     '链接', 'href',
@@ -2242,6 +2253,9 @@ function extractKeywords(requirement) {
       keywords.push(p);
     }
   }
+  
+  // 按长度降序排序，优先匹配更精确的关键词
+  keywords.sort((a, b) => b.length - a.length);
   
   // 如果没匹配到，用原始需求
   if (keywords.length === 0 && requirement.length > 0) {

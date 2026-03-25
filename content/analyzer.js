@@ -1609,6 +1609,81 @@ function showSaveSelectorDialog(selector, requirement, sendResponse) {
   };
 }
 
+// 显示导出按钮
+function showExportButtons(resultText) {
+  const container = document.getElementById('crawlmind-messages');
+  if (!container) return;
+  
+  // 移除已有的导出按钮
+  const existing = container.querySelector('.export-buttons');
+  if (existing) existing.remove();
+  
+  // 解析数据
+  const lines = resultText.split('\n').filter(l => l.trim().startsWith('数据'));
+  const dataItems = lines.map(line => {
+    const match = line.match(/^数据(\d+):\s*(.+)$/);
+    if (match) {
+      return { index: parseInt(match[1]), value: match[2] };
+    }
+    return null;
+  }).filter(d => d !== null);
+  
+  if (dataItems.length === 0) return;
+  
+  const exportDiv = document.createElement('div');
+  exportDiv.className = 'export-buttons';
+  exportDiv.style.cssText = 'padding: 12px; margin: 8px 0; background: #f0f0f0; border-radius: 8px; text-align: center;';
+  exportDiv.innerHTML = `
+    <div style="font-weight: 600; margin-bottom: 8px;">💾 导出数据 (共 ${dataItems.length} 条)</div>
+    <div style="display: flex; gap: 8px; justify-content: center;">
+      <button id="export-csv" style="padding: 8px 16px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">📄 导出 CSV</button>
+      <button id="export-excel" style="padding: 8px 16px; background: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer;">📊 导出 Excel</button>
+    </div>
+  `;
+  container.appendChild(exportDiv);
+  container.scrollTop = container.scrollHeight;
+  
+  // CSV 导出
+  document.getElementById('export-csv').onclick = () => {
+    // 添加 BOM + UTF-8 编码
+    const csvContent = '\uFEFF' + '序号,数据\n' + dataItems.map(d => `${d.index},"${d.value.replace(/"/g, '""')}"`).join('\n');
+    downloadFile(csvContent, 'crawlmind_data.csv', 'text/csv;charset=utf-8');
+  };
+  
+  // Excel 导出（CSV 格式，Excel 可以打开）
+  document.getElementById('export-excel').onclick = () => {
+    // 添加 BOM 让 Excel 正确识别中文 + UTF-8 编码
+    const excelContent = '\uFEFF' + '序号,数据\n' + dataItems.map(d => `${d.index},"${d.value.replace(/"/g, '""')}"`).join('\n');
+    downloadFile(excelContent, 'crawlmind_data.xls', 'application/vnd.ms-excel;charset=utf-8');
+  };
+}
+
+// 下载文件
+function downloadFile(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// 下载文件
+function downloadFile(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 let isExtracting = false;
 
 function setExtractingState(extracting) {
@@ -1664,7 +1739,13 @@ function sendMessage() {
       addMessage('system', '错误: ' + chrome.runtime.lastError.message);
       return;
     }
-    addMessage('system', response.result || '分析完成');
+    const resultText = response.result || '分析完成';
+    addMessage('system', resultText);
+    
+    // 如果有数据，显示导出按钮
+    if (resultText && resultText.includes('数据')) {
+      showExportButtons(resultText);
+    }
   };
   
   if (needAnalysis) {
