@@ -164,7 +164,7 @@ function findPaginationCandidates() {
   
   // 2. 再从后往前补充一些底部元素作为候选
   const allElements = Array.from(document.querySelectorAll('*'));
-  let补充 = 0;
+  let 补充 = 0;
   for (let i = allElements.length - 1; i >= 0; i--) {
     if (candidates.length >= 50 || 补充 >= 20) break;
     
